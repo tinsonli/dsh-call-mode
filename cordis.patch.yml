@@ -1,0 +1,5 @@
+# 通话模式：插入宿主行，使本包成为真正的 profile 层。
+# 客户端一半写在 package.json 的 dsh.client 里，不需要在这里声明。
+- insert:
+    - id: call-mode
+      name: '@dsh-external/dsh-call-mode'

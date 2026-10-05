@@ -1,0 +1,17 @@
+# 模型权重与下载产物：不随源码分发
+models/
+*.onnx
+*.tar.bz2
+*.partial
+
+# 运行时产物
+*.log
+samples/
+*.wav
+
+# 依赖与系统文件
+node_modules/
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

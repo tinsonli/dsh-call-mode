@@ -1,0 +1,61 @@
+{
+  "name": "@dsh-external/dsh-call-mode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Voice call mode for DSH: phone-style voice conversation with the agent, which builds a team and dispatches your request in the background.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "voice",
+    "speech-to-text",
+    "text-to-speech",
+    "sensevoice",
+    "matcha-tts",
+    "sherpa-onnx"
+  ],
+  "author": "tinsonli",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tinsonli/dsh-call-mode.git"
+  },
+  "homepage": "https://github.com/tinsonli/dsh-call-mode#readme",
+  "bugs": {
+    "url": "https://github.com/tinsonli/dsh-call-mode/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "meta": {
+    "title": "Call Mode",
+    "titleZh": "通话模式",
+    "description": "Phone-style voice call with the agent: local STT/TTS, team dispatches in the background."
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "server"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}
