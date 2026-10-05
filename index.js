@@ -25,6 +25,8 @@ const CALL_DIR = path.join(HOME, '.dsh', 'call-mode');
 const LOG_FILE = path.join(CALL_DIR, 'call.log');
 const ROUTE_BASE = '/api/call-mode';
 const MAX_PCM_BYTES = 8 * 1024 * 1024;
+/** 试听文本上限：用户快速横比音色，一句话就够，绝不能一次生成几分钟音频。 */
+const PREVIEW_MAX_CHARS = 24;
 
 /**
  * 各 TTS 引擎的默认语速——**引擎→语速只有这一张表**（worker 里只保留「安全钳制」，不重复默认值）。
@@ -217,6 +219,12 @@ class CallController {
      * 默认开；关掉即完全恢复旧行为。
      */
     this.speakUnpromptedReplies = config?.speakUnpromptedReplies !== false;
+    /**
+     * 通话中试听后选定的音色（sid）。undefined = 用 worker 启动时的默认音色。
+     * 只记住一个数：切音色不重启 worker、不发 /stop、不断通话。
+     */
+    this.ttsSid = Number.isInteger(config?.sid) ? config.sid : undefined;
+    this.voiceCache = undefined;   // { at, value }：/voices 的短暂缓存，横比时不反复打扰 worker
     this.modelRoot = config?.modelsDir ?? process.env.DSH_CALL_MODELS ?? path.join(CALL_DIR, 'models');
     this.provisionState = { phase: 'unknown', percent: 0, label: '', detail: '' };
     this.provisionPromise = undefined;
@@ -468,13 +476,48 @@ class CallController {
     return res.json();
   }
 
-  /** @param {number} [speed] 省略时用构造时解析好的通话语速（this.speed）。 */
-  async synthesize(text, speed = this.speed) {
+  /**
+   * @param {number} [speed] 省略时用构造时解析好的通话语速（this.speed）。
+   * @param {number} [sid] 省略时用当前通话选定的音色（this.ttsSid）；两者都省略则用 worker 默认。
+   */
+  async synthesize(text, speed = this.speed, sid = this.ttsSid) {
+    const payload = { text, speed };
+    if (Number.isInteger(sid)) payload.sid = sid;      // worker 侧校验 0..speakers-1，非法直接 400
     const res = await this.#worker('/tts', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text, speed }),
+      body: JSON.stringify(payload),
     });
     return Buffer.from(await res.arrayBuffer());
+  }
+
+  /**
+   * 可用音色列表。**从 worker /health 的 speakers 推导**，不硬编码任何音色名：
+   * speakers 是当前引擎的说话人数（matcha=1、Kokoro 多语言 v1.1=103），
+   * 所以想试听 Kokoro 那 103 个音色，worker 必须以 kokoro 引擎启动（DSH_TTS_ENGINE）。
+   * 5 秒缓存：用户在快速横比时不会每点一次就问一遍 worker。
+   */
+  async voices(options = {}) {
+    const now = Date.now();
+    if (options.fresh !== true && this.voiceCache !== undefined && now - this.voiceCache.at < 5000) return this.voiceCache.value;
+    const h = await this.health().catch(() => undefined);
+    const speakers = Number.isInteger(h?.speakers) && h.speakers > 0 ? h.speakers : 0;
+    const engine = typeof h?.engine === 'string' ? h.engine : 'unknown';
+    const sid = Number.isInteger(this.ttsSid) ? this.ttsSid : (Number.isInteger(h?.sid) ? h.sid : 0);
+    const value = {
+      engine,
+      speakers,
+      sid,
+      voices: Array.from({ length: speakers }, (_, i) => ({ sid: i, label: `音色 ${i}` })),
+    };
+    this.voiceCache = { at: now, value };
+    return value;
+  }
+
+  /** 设定当前通话的音色（只在宿主侧记一个数）。 */
+  setSid(sid) {
+    this.ttsSid = sid;
+    this.voiceCache = undefined;      // 下次读 /voices 拿到新的「当前」
+    return this.ttsSid;
   }
 
   async cancelSpeech() {
@@ -744,6 +787,34 @@ function registerRoutes(ctx, controller) {
     ['/poll', ['POST'], guard(async (request) => {
       const { sessionId } = await body(request);
       return { chunks: controller.drainSpeech(sessionId) };
+    })],
+    // 音色：列出（从 worker /health 推导）/ 试听 / 设为当前。三条都不重启 worker、不打断通话。
+    ['/voices', ['GET', 'POST'], guard(async () => controller.voices())],
+    ['/preview', ['POST'], guard(async (request) => {
+      const payload = await body(request);
+      const info = await controller.voices();
+      // 与 worker 同一套约定：缺省 / null / 空串都表示「用当前音色」
+      const asked = payload.sid;
+      const sid = asked === undefined || asked === null || asked === '' ? info.sid : Number(asked);
+      if (!Number.isInteger(sid) || sid < 0 || (info.speakers > 0 && sid >= info.speakers)) {
+        throw new Error(`音色编号必须在 0..${Math.max(0, info.speakers - 1)} 之间（收到 ${JSON.stringify(payload.sid)}）`);
+      }
+      const text = (typeof payload.text === 'string' && payload.text.trim() !== '' ? payload.text.trim() : '你好')
+        .slice(0, PREVIEW_MAX_CHARS);
+      const pcm = await controller.synthesize(text, controller.speed, sid);
+      return { sid, text, engine: info.engine, speakers: info.speakers, chunks: [pcm.toString('base64')] };
+    })],
+    ['/voice', ['POST'], guard(async (request) => {
+      const payload = await body(request);
+      const info = await controller.voices();
+      const asked = payload.sid;
+      const sid = asked === undefined || asked === null || asked === '' ? info.sid : Number(asked);
+      if (!Number.isInteger(sid) || sid < 0 || (info.speakers > 0 && sid >= info.speakers)) {
+        throw new Error(`音色编号必须在 0..${Math.max(0, info.speakers - 1)} 之间（收到 ${JSON.stringify(payload.sid)}）`);
+      }
+      controller.setSid(sid);
+      log('当前音色已切换 sid=', sid, 'engine=', info.engine, 'speakers=', info.speakers);
+      return { sid, engine: info.engine, speakers: info.speakers };
     })],
   ];
   for (const [suffix, methods, fetch] of routes) {

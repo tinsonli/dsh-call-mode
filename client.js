@@ -68,6 +68,10 @@ window.__ModuleLoader__.load({
       hello: (info) => callApi('/hello', info ?? {}),
       poll: (info) => callApi('/poll', info ?? {}),
       provision: () => callApi('/provision', {}),
+      // 音色：列出 / 试听 / 设为当前（三条都不重启 worker、不断通话）
+      voices: () => callApi('/voices', {}),
+      preview: (args) => callApi('/preview', args),
+      setVoice: (args) => callApi('/voice', args),
     };
 
     // ---------------------------------------------------------------- 端点检测
@@ -406,6 +410,7 @@ window.__ModuleLoader__.load({
           level: 0, mode: 'ptt', transcript: '', reply: '', download: null,
           panelOpen: false,           // 纯 UI 标志，和通话存亡无关
           connectedAt: 0, elapsedSec: 0,
+          voiceOpen: false, voice: null, voiceList: null, previewSid: null, notice: '',
         };
       }
 
@@ -591,7 +596,12 @@ window.__ModuleLoader__.load({
 
       #onEngineEvent(ev) {
         if (this.disposed) return;
-        if (ev.type === 'level') { this.#patch({ level: ev.level }); return; }
+        if (ev.type === 'level') {
+          // 电平只求视觉平滑：抖动小于 0.004 就不发新快照。
+          // 音色列表可能有上百行，不节流的话每帧都会把整张表重渲染一遍。
+          if (Math.abs(ev.level - this.state.level) > 0.004) this.#patch({ level: ev.level });
+          return;
+        }
         if (ev.type === 'state') {
           if (ev.state === 'recording') this.#patch({ status: this.t('listening') });
           else if (ev.state === 'speaking') this.#patch({ status: this.t('speaking') });
@@ -643,6 +653,66 @@ window.__ModuleLoader__.load({
         void this.call.stop();
         this.#patch({ phase: 'closed', panelOpen: false, level: 0 });
       }
+
+      // ----------------------------------------------------------- 音色试听/切换
+      /** 展开/收起音色区；首次展开时拉一次列表。 */
+      async toggleVoices() {
+        if (this.disposed) return;
+        const open = this.state.voiceOpen !== true;
+        this.#patch({ voiceOpen: open, notice: '' });
+        if (open && this.state.voiceList === null) await this.refreshVoices();
+      }
+
+      /** 拉可用音色列表（宿主从 worker /health 的 speakers 推导，客户端不写死数量）。 */
+      async refreshVoices() {
+        if (this.disposed) return;
+        try {
+          const info = unwrap(await this.call.voices());
+          if (this.disposed) return;
+          this.#patch({
+            voice: { engine: info.engine, speakers: info.speakers, sid: info.sid },
+            voiceList: Array.isArray(info.voices) ? info.voices : [],
+          });
+        } catch (e) {
+          if (!this.disposed) this.#patch({ voiceList: [], notice: `${this.t('voiceFailed')}: ${e.message}` });
+        }
+      }
+
+      /**
+       * 试听某个音色。
+       * 冲突策略：**试听优先——先掐掉本机正在播的语音**（engine.stopPlayback），
+       * 因为用户是在快速横比，等助手把长回复念完就没法比了。但**不** cancel 当前回合、
+       * 也**不**发 /stop：agent 的活照跑，宿主队列不动，试听完该念的还会念。
+       * 播放仍走既有的 engine.play（和正常回复同一条音频路径），不另造通路。
+       */
+      async previewVoice(sid) {
+        if (this.disposed) return;
+        this.engine.stopPlayback();
+        this.#patch({ previewSid: sid, notice: '' });
+        try {
+          const res = unwrap(await this.call.preview({ sessionId: this.sessionId, sid }));
+          if (this.disposed) return;
+          for (const chunk of res?.chunks ?? []) this.engine.play(b64.toPcm(chunk));
+          this.#patch({ previewSid: null });
+        } catch (e) {
+          if (!this.disposed) this.#patch({ previewSid: null, notice: `${this.t('voiceFailed')}: ${e.message}` });
+        }
+      }
+
+      /** 把某个音色设为当前：之后所有合成（含迟到补播、开场问候）都用它。不重启 worker。 */
+      async setVoice(sid) {
+        if (this.disposed) return;
+        try {
+          const res = unwrap(await this.call.setVoice({ sessionId: this.sessionId, sid }));
+          if (this.disposed) return;
+          this.#patch({
+            voice: { engine: res.engine, speakers: res.speakers, sid: res.sid },
+            notice: `${this.t('voiceSet')} #${res.sid}`,
+          });
+        } catch (e) {
+          if (!this.disposed) this.#patch({ notice: `${this.t('voiceFailed')}: ${e.message}` });
+        }
+      }
     }
 
     // ---------------------------------------------------------------- 通话面板
@@ -675,6 +745,10 @@ window.__ModuleLoader__.load({
       font: 'var(--dsw-font-sm, 12px/1.5 system-ui)', color: 'var(--dsw-alias-label-primary, #111)', zIndex: 60,
     };
     const hintStyle = { marginTop: 8, color: 'var(--dsw-alias-label-secondary, #666)' };
+    const voiceListStyle = {
+      marginTop: 6, maxHeight: 170, overflowY: 'auto', padding: '4px 6px',
+      border: '1px solid var(--dsw-alias-border-l1, #ddd)', borderRadius: 'var(--dsw-radius-md, 8px)',
+    };
     const warnStyle = {
       marginTop: 8, padding: '6px 8px', borderRadius: 'var(--dsw-radius-md, 8px)',
       background: '#fff4e5', border: '1px solid #f0b429', color: '#7a4d00',
@@ -743,6 +817,9 @@ window.__ModuleLoader__.load({
         setMode(mode) { session?.setMode(mode); },
         startCapture() { session?.startCapture(); },
         stopCapture() { session?.stopCapture(); },
+        toggleVoices() { void session?.toggleVoices(); },
+        previewVoice(sid) { void session?.previewVoice(sid); },
+        setVoice(sid) { void session?.setVoice(sid); },
         setTranslator(fn) { translator = fn; },
         setOverlayEl(el) { overlayEl = el; },
         setButtonEl(el) { buttonEl = el; },
@@ -863,6 +940,31 @@ window.__ModuleLoader__.load({
           h('div', { style: { width: `${Math.min(100, Math.round((level / 0.15) * 100))}%`, height: '100%', background: 'var(--dsw-alias-brand-primary, #3b82f6)', transition: 'width .06s linear' } })),
         bindArea,
         confirmArea,
+        // 音色区：一眼看到当前引擎/数量/当前音色，展开后逐个试听、一键设为当前。
+        // 数量由宿主从 worker /health 的 speakers 推导，这里不写死。
+        h('div', { style: { marginTop: 8 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('button', { type: 'button', style: { ...smallBtn, flex: 'none' },
+              onClick: () => center.toggleVoices() }, `${t('voiceSection')} ${view.state.voiceOpen ? '▾' : '▸'}`),
+            h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } },
+              view.state.voice === null
+                ? t('voiceLoading')
+                : `${view.state.voice.engine} · ${view.state.voice.speakers} ${t('voiceCount')} · ${t('voiceCurrent')} #${view.state.voice.sid}`)),
+          view.state.voiceOpen && h('div', null,
+            view.state.voice !== null && view.state.voice.speakers <= 1 && h('div', { style: hintStyle }, t('voiceSingle')),
+            view.state.voiceList === null
+              ? h('div', { style: hintStyle }, t('voiceLoading'))
+              : h('div', { style: voiceListStyle },
+                  ...view.state.voiceList.map((v) => h('div', { key: v.sid, style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0' } },
+                    h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } }, `#${v.sid} ${v.label}`),
+                    h('button', { type: 'button', style: { ...smallBtn, flex: 'none', padding: '2px 8px' },
+                      onClick: () => center.previewVoice(v.sid) },
+                      view.state.previewSid === v.sid ? t('voicePlaying') : t('voicePreview')),
+                    h('button', { type: 'button', style: { ...smallBtn, flex: 'none', padding: '2px 8px' },
+                      disabled: view.state.voice !== null && view.state.voice.sid === v.sid,
+                      onClick: () => center.setVoice(v.sid) },
+                      view.state.voice !== null && view.state.voice.sid === v.sid ? t('voiceCurrent') : t('voiceUse')))))),
+          view.state.notice !== '' && h('div', { style: { marginTop: 4, fontSize: 11, color: '#b42318' } }, view.state.notice)),
         mode === 'ptt'
           ? h('button', {
               type: 'button', disabled: phase !== 'live',
@@ -953,6 +1055,10 @@ window.__ModuleLoader__.load({
             confirm: '确认', cancel: '取消', rebound: '已接到当前对话',
             rebindFailed: '换绑失败，仍挂在原对话', waitTurn: '正在处理上一句，稍后再切换',
             dialing: '正在呼叫', noAnswer: '无法接通（对方无响应）', assistantName: 'DSH 助手',
+            voiceSection: '音色', voicePreview: '试听', voicePlaying: '播放中…', voiceUse: '设为当前',
+            voiceCurrent: '当前', voiceCount: '个', voiceLoading: '读取音色…',
+            voiceSet: '已设为当前音色', voiceFailed: '音色操作失败',
+            voiceSingle: '当前引擎只有 1 个音色；Kokoro 的 103 个音色需要以 DSH_TTS_ENGINE=kokoro 启动 DSH',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
@@ -968,6 +1074,10 @@ window.__ModuleLoader__.load({
             confirm: 'Confirm', cancel: 'Cancel', rebound: 'Moved to this conversation',
             rebindFailed: 'Move failed; still attached to the previous conversation', waitTurn: 'Still processing your last sentence — try again in a moment',
             dialing: 'Calling', noAnswer: 'Could not connect (no answer)', assistantName: 'DSH Assistant',
+            voiceSection: 'Voices', voicePreview: 'Preview', voicePlaying: 'Playing…', voiceUse: 'Use',
+            voiceCurrent: 'Current', voiceCount: 'voices', voiceLoading: 'Loading voices…',
+            voiceSet: 'Now using voice', voiceFailed: 'Voice action failed',
+            voiceSingle: 'This engine has a single voice; Kokoro\u2019s 103 voices need DSH started with DSH_TTS_ENGINE=kokoro',
           },
         }), 'dsh-call-mode: dictionaries');
 
