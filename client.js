@@ -87,7 +87,7 @@ window.__ModuleLoader__.load({
     function createEndpointDetector(options = {}) {
       const frameMs = options.frameMs ?? 64;            // 1024 采样 @16k
       const minSpeechMs = options.minSpeechMs ?? 200;   // 连续有声多久算「开始说话」
-      const silenceMs = options.silenceMs ?? 700;       // 静音多久算「说完了」
+      const silenceMs = options.silenceMs ?? 3000;      // 静音多久算「说完了」（3s：句子中间的换气/想词停顿不应被当成说完）
       const maxUtteranceMs = options.maxUtteranceMs ?? 30000;
       const absFloor = options.absFloor ?? 0.006;       // 绝对下限，防静音室里噪声底趋近 0
       const ratio = options.ratio ?? 3.5;               // 高出噪声底多少倍算有声
@@ -294,6 +294,357 @@ window.__ModuleLoader__.load({
       #setState(state) { this.state = state; this.onEvent({ type: 'state', state }); }
     }
 
+    // ---------------------------------------------------------------- 铃声 / 接通音
+    /**
+     * 铃音与接通音的默认参数。全部**现场合成**（振荡器 + 增益包络），
+     * 仓库里不放任何 mp3/wav/ogg：省体积、免格式兼容、无授权问题。
+     * enabled/volume 就是「响铃开关 / 音量 / 静音」的配置入口。
+     */
+    const SOUND_DEFAULTS = {
+      enabled: true,        // 关掉就不响铃、不播接通音（静音）
+      volume: 0.18,         // 0.18 在系统音量下不刺耳
+      ringPeriodMs: 2400,   // 一次「叮铃」+ 间隔
+      ringTimeoutMs: 30000, // 最多响 30s，超时收口
+    };
+
+    /**
+     * 来电铃声 + 接通音。用**独立的 AudioContext**：铃声必须在
+     * 模型自检 / worker 拉起之前就响起来，不能等 CallEngine.open()。
+     * 所有方法都不抛异常——铃声问题绝不能挡住或打断通话。
+     */
+    function createCallSounds(options = {}) {
+      const cfg = { ...SOUND_DEFAULTS, ...options };
+      let ctx = null;
+      let timer = null;
+      let live = [];
+      const ensure = () => {
+        if (ctx === null) ctx = new AudioContext();
+        if (ctx.state === 'suspended') void ctx.resume?.();
+        return ctx;
+      };
+      /** 一串音符：[频率, 起始偏移s, 时长s, 相对音量]，用增益包络防爆音。 */
+      const burst = (specs) => {
+        const audio = ensure();
+        const at = audio.currentTime;
+        for (const [freq, offset, dur, gain] of specs) {
+          const osc = audio.createOscillator();
+          const amp = audio.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, at + offset);
+          amp.gain.setValueAtTime(0, at + offset);
+          amp.gain.linearRampToValueAtTime(cfg.volume * gain, at + offset + 0.02);
+          amp.gain.setValueAtTime(cfg.volume * gain, at + offset + Math.max(0.03, dur - 0.05));
+          amp.gain.linearRampToValueAtTime(0, at + offset + dur);
+          osc.connect(amp);
+          amp.connect(audio.destination);
+          osc.start(at + offset);
+          osc.stop(at + offset + dur + 0.02);
+          live.push(osc);
+        }
+      };
+      const ringOnce = () => {
+        try { burst([[660, 0, 0.32, 1], [520, 0.36, 0.4, 0.85]]); } catch { /* 忽略 */ }
+      };
+      return {
+        get ringing() { return timer !== null; },
+        start() {
+          if (cfg.enabled !== true || timer !== null) return;
+          ringOnce();
+          timer = setInterval(ringOnce, cfg.ringPeriodMs);
+        },
+        /** 立刻静音（接通、挂断、超时都要立刻停）。 */
+        stop() {
+          if (timer !== null) { clearInterval(timer); timer = null; }
+          const nodes = live;
+          live = [];
+          for (const node of nodes) { try { node.stop(); } catch { /* 已停 */ } }
+        },
+        /** 接通音「嘟」：短促单音，表示对方接起来了。 */
+        beep() {
+          if (cfg.enabled !== true) return;
+          try { burst([[880, 0, 0.15, 0.75]]); } catch { /* 忽略 */ }
+        },
+        close() {
+          this.stop();
+          try { ctx?.close?.(); } catch { /* 忽略 */ }
+          ctx = null;
+        },
+      };
+    }
+
+    // ---------------------------------------------------------------- 通话会话
+    /**
+     * 一次通话的完整生命周期，**与面板可见性、与 React 组件挂载都无关**。
+     *
+     * 之前通话活在 CallPanel 的 effect 里，面板一卸载（点面板外收起、切会话）
+     * cleanup 就 engine.close() + call.stop() —— 「收起面板」等于「挂断」。
+     * 现在把这些搬进这个纯 JS 类：收起面板只是 closePanel()（纯 UI 标志），
+     * 只有显式 hangUp() 或组件真卸载时的 dispose() 才回收资源。
+     *
+     * 不依赖 React/DOM（engine 可注入），所以「收起不等于挂断」可以脱浏览器单测。
+     */
+    class CallSession {
+      constructor({ call, sessionId, t, engine, sounds, ringTimeoutMs }) {
+        this.call = call;
+        this.sessionId = sessionId;
+        this.t = t;
+        this.engine = engine ?? new CallEngine((ev) => this.#onEngineEvent(ev));
+        this.sounds = sounds ?? createCallSounds();
+        this.ringTimeoutMs = ringTimeoutMs ?? SOUND_DEFAULTS.ringTimeoutMs;
+        this.listeners = new Set();
+        this.queue = [];              // agent 思考期间用户说的话排队，不丢
+        this.busy = false;
+        this.disposed = false;
+        this.pollTimer = null;
+        this.ringTimer = null;        // 响铃上限（绝不允许无限响）
+        this.tickTimer = null;        // 通话计时
+        this.connectedAt = 0;
+        this.startPromise = null;     // 首次接通只跑一次：重新展开面板不会重新 /start
+        this.state = {
+          phase: 'dialing',           // dialing | provisioning | live | failed | error | closed
+          status: t('dialing'),
+          level: 0, mode: 'ptt', transcript: '', reply: '', download: null,
+          panelOpen: false,           // 纯 UI 标志，和通话存亡无关
+          connectedAt: 0, elapsedSec: 0,
+        };
+      }
+
+      /** 通话是否仍活着（面板是否可见无关）。 */
+      get inCall() {
+        const p = this.state.phase;
+        return p === 'dialing' || p === 'provisioning' || p === 'live';
+      }
+
+      /** 本地待提交的语音段数（换绑前要确认它是 0，别把旧会话的话串到新会话）。 */
+      get queued() { return this.queue.length; }
+
+      /**
+       * 把通话接到另一个会话（换绑）：撤旧守则 → 注新守则 → 后续语音提交到新会话。
+       * 只调 /start（不带 /stop）：宿主在子进程存活时只重挂守则（index.js:207-210
+       * reused:true），activateRules 会先 deactivateRules 再挂新的（index.js:290-313），
+       * 所以 worker 不重启、麦克风与 AudioContext 全程不断。
+       *
+       * 旧会话里排队待投递的语音留在宿主、按旧 sessionId 索引，不会被新会话取走
+       * （不串台）；因此本地还有排队时拒绝换绑，交由 UI 提示稍后再试。
+       */
+      async rebind(nextSessionId) {
+        if (this.disposed || !nextSessionId || nextSessionId === this.sessionId) return false;
+        if (this.busy || this.queue.length > 0) return false;
+        const previous = this.sessionId;
+        this.sessionId = nextSessionId;              // 之后的 /converse、/poll 都用新 id
+        try {
+          await unwrap(this.call.start({ sessionId: nextSessionId }));
+          this.#patch({ status: this.t('rebound') });
+          return true;
+        } catch (e) {
+          this.sessionId = previous;                 // 失败回滚，仍挂原会话
+          this.#patch({ status: `${this.t('error')}: ${e.message}` });
+          return false;
+        }
+      }
+
+      /** 订阅状态快照；返回退订函数。每次变更给出新对象，便于 React setState。 */
+      subscribe(listener) {
+        this.listeners.add(listener);
+        return () => { this.listeners.delete(listener); };
+      }
+
+      #patch(patch) {
+        this.state = { ...this.state, ...patch };
+        for (const listener of this.listeners) {
+          try { listener(this.state); } catch { /* 视图报错不能影响通话 */ }
+        }
+      }
+
+      /** 展开面板；首次展开才真的接通（重复展开不会再 /start，也不会重建 AudioContext）。 */
+      openPanel() {
+        if (this.disposed) return Promise.resolve();
+        this.#patch({ panelOpen: true });
+        return this.#ensureStarted();
+      }
+
+      /** 收起面板：只收 UI。麦克风、AudioContext、播放队列、/poll 轮询全部保持。 */
+      closePanel() {
+        if (this.disposed || this.state.panelOpen !== true) return;
+        this.#patch({ panelOpen: false });
+      }
+
+      #ensureStarted() {
+        if (this.startPromise !== null) return this.startPromise;
+        // 立刻响铃 + 立刻进入呼叫态：模型自检/worker 拉起与响铃并行，用户不用干等
+        this.#startRinging();
+        this.startPromise = this.#run();
+        return this.startPromise;
+      }
+
+      /** 起铃并挂上「最多响 N 秒」的收口定时器。 */
+      #startRinging() {
+        try { this.sounds.start(); } catch { /* 铃声失败不能挡住通话 */ }
+        this.#patch({ phase: 'dialing', status: this.t('dialing') });
+        if (this.ringTimer !== null) clearTimeout(this.ringTimer);
+        this.ringTimer = setTimeout(() => this.#onRingTimeout(), this.ringTimeoutMs);
+      }
+
+      /** 停铃（幂等）：接通、挂断、出错、超时都要走这里。 */
+      #stopRinging() {
+        if (this.ringTimer !== null) { clearTimeout(this.ringTimer); this.ringTimer = null; }
+        try { this.sounds.stop(); } catch { /* 忽略 */ }
+      }
+
+      /** 响铃超时：停铃 + 收口 + 明确失败提示，绝不无限响、不静默卡住。 */
+      #onRingTimeout() {
+        this.ringTimer = null;
+        if (this.disposed || this.state.phase === 'live') return;
+        try { this.sounds.stop(); } catch { /* 忽略 */ }
+        this.disposed = true;
+        this.queue.length = 0;
+        if (this.pollTimer !== null) { clearInterval(this.pollTimer); this.pollTimer = null; }
+        try { this.engine.close(); } catch { /* 忽略 */ }
+        void this.call.stop();
+        this.#patch({ phase: 'failed', status: this.t('noAnswer'), level: 0 });
+      }
+
+      #startTicker() {
+        if (this.tickTimer !== null) return;
+        this.tickTimer = setInterval(() => {
+          if (this.disposed) return;
+          this.#patch({ elapsedSec: Math.round((Date.now() - this.connectedAt) / 1000) });
+        }, 1000);
+      }
+
+      async #run() {
+        try {
+          if (!this.sessionId) throw new Error(this.t('noSession'));
+          let started = unwrap(await this.call.start({ sessionId: this.sessionId }));
+          // 首次使用：宿主会先把识别与合成模型下载好（检测若空就下载），
+          // 这里把进度显示出来，下完自动接通；这段时间铃声一直响着。
+          while (started?.provisioning === true) {
+            if (this.disposed) return;
+            const p = started.progress ?? {};
+            this.#patch({ phase: 'provisioning', download: p, status: `${this.t('preparingModels')} ${p.label ?? ''} ${p.percent ?? 0}%`.trim() });
+            await new Promise((r) => setTimeout(r, 1500));
+            if (this.disposed) return;
+            const st = unwrap(await this.call.provision());
+            if (st?.phase === 'failed') throw new Error(`${this.t('provisionFailed')}：${st.detail ?? ''}`);
+            started = st?.phase === 'ready'
+              ? unwrap(await this.call.start({ sessionId: this.sessionId }))
+              : { provisioning: true, progress: st };
+          }
+          await this.engine.open();
+          if (this.disposed) { try { this.engine.close(); } catch { /* 忽略 */ } return; }
+          // 接通顺序固定：停铃 → 一声「嘟」→ 问候语
+          this.#stopRinging();
+          this.connectedAt = Date.now();
+          this.#patch({ phase: 'live', status: this.t('live'), connectedAt: this.connectedAt, elapsedSec: 0 });
+          this.#startTicker();
+          try { this.sounds.beep(); } catch { /* 忽略 */ }
+          // 接通问候由宿主合成，播放它即证明「说」的通路正常
+          if (started?.greeting) this.engine.play(b64.toPcm(started.greeting));
+          this.#startPolling();
+        } catch (e) {
+          this.#stopRinging();
+          if (!this.disposed) this.#patch({ phase: 'error', status: `${this.t('error')}: ${e.message}` });
+        }
+      }
+
+      #startPolling() {
+        if (this.pollTimer !== null || this.disposed) return;
+        // 空闲时轮询「迟到回复」：agent 答得慢时，真实结果会以这种方式补播
+        this.pollTimer = setInterval(() => {
+          if (this.disposed || this.busy || this.engine.state !== 'idle') return;
+          void (async () => {
+            try {
+              const res = unwrap(await this.call.poll({ sessionId: this.sessionId }));
+              for (const chunk of res?.chunks ?? []) this.engine.play(b64.toPcm(chunk));
+            } catch { /* 轮询失败忽略，下一次再试 */ }
+          })();
+        }, 3000);
+      }
+
+      /** 收到一段用户语音：入队并尝试处理（最多留最近 3 段，避免积压）。 */
+      converse(pcm) {
+        if (this.disposed) return;
+        this.queue.push(pcm);
+        if (this.queue.length > 3) this.queue.shift();
+        void this.#drain();
+      }
+
+      /** 依次处理排队中的每一段话；同一时刻只有一次往返在飞。 */
+      async #drain() {
+        if (this.busy || this.disposed) return;
+        const pcm = this.queue.shift();
+        if (pcm === undefined) return;
+        this.busy = true;
+        try {
+          this.#patch({ status: this.queue.length > 0 ? this.t('queued') : this.t('thinking') });
+          const res = unwrap(await this.call.converse({ sessionId: this.sessionId, pcm: b64.fromPcm(pcm), language: this.t('lang') === 'zh' ? 'zh' : 'auto' }));
+          if (this.disposed) return;
+          this.#patch({ transcript: res.transcript || '', reply: res.replyText || '', status: this.t('live') });
+          for (const chunk of res.chunks || []) this.engine.play(b64.toPcm(chunk));
+        } catch (e) {
+          if (!this.disposed) this.#patch({ status: `${this.t('error')}: ${e.message}` });
+        } finally {
+          this.busy = false;
+          if (!this.disposed && this.queue.length > 0) void this.#drain();
+        }
+      }
+
+      #onEngineEvent(ev) {
+        if (this.disposed) return;
+        if (ev.type === 'level') { this.#patch({ level: ev.level }); return; }
+        if (ev.type === 'state') {
+          if (ev.state === 'recording') this.#patch({ status: this.t('listening') });
+          else if (ev.state === 'speaking') this.#patch({ status: this.t('speaking') });
+          else if (ev.state === 'idle' && this.state.phase === 'live') this.#patch({ status: this.t('live') });
+          return;
+        }
+        if (ev.type === 'utterance') { this.converse(ev.pcm); return; }
+        if (ev.type === 'bargeIn') { void this.call.cancel(); this.engine.stopPlayback(); }
+      }
+
+      setMode(mode) {
+        if (this.disposed) return;
+        this.engine.setMode(mode);
+        this.#patch({ mode, status: mode === 'auto' ? this.t('autoOn') : this.t('pttOn') });
+      }
+
+      startCapture() {
+        if (this.disposed) return;
+        this.engine.stopPlayback();
+        this.engine.startCapture();
+      }
+
+      stopCapture() {
+        if (this.disposed) return;
+        const pcm = this.engine.stopCapture();
+        if (pcm && pcm.length > TARGET_RATE * 0.2) this.converse(pcm);
+      }
+
+      /** 显式挂断：停录音、停播放、调 /stop、关 AudioContext，并收起面板。 */
+      hangUp() {
+        this.#teardown();
+      }
+
+      /** 组件真卸载（切会话/离开页面）时回收麦克风与宿主子进程；幂等，不会重复 /stop。 */
+      dispose() {
+        this.#teardown();
+      }
+
+      #teardown() {
+        if (this.disposed) return;
+        this.disposed = true;                 // 先置位：close()/stop() 的后续事件不再影响状态
+        this.#stopRinging();                  // 任何时刻挂断都立刻停铃（含还在响铃时）
+        if (this.pollTimer !== null) { clearInterval(this.pollTimer); this.pollTimer = null; }
+        if (this.tickTimer !== null) { clearInterval(this.tickTimer); this.tickTimer = null; }
+        this.queue.length = 0;
+        this.startPromise = null;
+        try { this.sounds.close(); } catch { /* 忽略 */ }
+        try { this.engine.close(); } catch { /* 忽略 */ }
+        void this.call.stop();
+        this.#patch({ phase: 'closed', panelOpen: false, level: 0 });
+      }
+    }
+
     // ---------------------------------------------------------------- 通话面板
     function IconCall({ active }) {
       return h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true },
@@ -317,175 +668,275 @@ window.__ModuleLoader__.load({
       color: 'var(--dsw-alias-label-primary, #111)', cursor: 'pointer', font: 'inherit',
     };
 
-    function CallPanel({ engine, call, sessionId, t, onClose }) {
-      const [phase, setPhase] = React.useState('connecting'); // connecting | live | error | closing
-      const [status, setStatus] = React.useState(t('connecting'));
-      const [level, setLevel] = React.useState(0);
-      const [mode, setMode] = React.useState('ptt');
-      const [transcript, setTranscript] = React.useState('');
-      const [reply, setReply] = React.useState('');
-      const [download, setDownload] = React.useState(null);
-      const engineRef = React.useRef(null);
-      const busyRef = React.useRef(false);
-      const queueRef = React.useRef([]);   // agent 思考期间用户说的话排队，不丢
+    const overlayStyle = {
+      position: 'fixed', right: 16, bottom: 76, width: 320, padding: 12,
+      background: 'var(--dsw-alias-bg-layer-2, #fff)', border: '1px solid var(--dsw-alias-border-l2, #ddd)',
+      borderRadius: 'var(--dsw-radius-lg, 10px)', boxShadow: 'var(--dsw-shadow-lv1, 0 10px 32px rgba(0,0,0,.22))',
+      font: 'var(--dsw-font-sm, 12px/1.5 system-ui)', color: 'var(--dsw-alias-label-primary, #111)', zIndex: 60,
+    };
+    const hintStyle = { marginTop: 8, color: 'var(--dsw-alias-label-secondary, #666)' };
+    const warnStyle = {
+      marginTop: 8, padding: '6px 8px', borderRadius: 'var(--dsw-radius-md, 8px)',
+      background: '#fff4e5', border: '1px solid #f0b429', color: '#7a4d00',
+    };
+    const confirmStyle = {
+      marginTop: 8, padding: 8, borderRadius: 'var(--dsw-radius-md, 8px)',
+      background: 'var(--dsw-alias-interactive-bg-hover, #f2f4f7)', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
+    };
 
-      /** 依次处理排队中的每一段话；同一时刻只有一次往返在飞。 */
-      const drain = React.useCallback(async () => {
-        if (busyRef.current) return;
-        const pcm = queueRef.current.shift();
-        if (pcm === undefined) return;
-        busyRef.current = true;
-        try {
-          setStatus(queueRef.current.length > 0 ? t('queued') : t('thinking'));
-          const res = unwrap(await call.converse({ sessionId, pcm: b64.fromPcm(pcm), language: t('lang') === 'zh' ? 'zh' : 'auto' }));
-          setTranscript(res.transcript || '');
-          setReply(res.replyText || '');
-          setStatus(t('live'));
-          for (const chunk of res.chunks || []) engineRef.current?.play(b64.toPcm(chunk));
-        } catch (e) {
-          setStatus(`${t('error')}: ${e.message}`);
-        } finally {
-          busyRef.current = false;
-          if (queueRef.current.length > 0) void drain();
+    // ---------------------------------------------------------------- 通话中心
+    /**
+     * 通话的全局中心：UI 住在 root 作用域的 shell.overlay（切对话不卸载），
+     * 内核 CallSession 只记住自己绑定了哪个会话。输入栏按钮只是入口 + 状态指示。
+     *
+     * 这里也是「浮层可见性 / 换绑确认」的唯一来源——收起浮层、切对话都不碰通话，
+     * 只有 hangUp()（显式挂断）与 dispose()（页面/插件真卸载）会回收。
+     */
+    function createCallCenter({ call, label, sounds, ringTimeoutMs }) {
+      const listeners = new Set();
+      let session = null;
+      let overlayOpen = false;
+      let screenSessionId = '';       // 输入栏按钮上报的「屏幕上正在看的会话」
+      let confirmTarget = null;       // 待确认的换绑目标
+      let notice = '';
+      let translator = (key) => key;
+      let overlayEl = null;
+      let buttonEl = null;
+      const t = (key) => translator(key);
+
+      const snapshot = () => ({
+        boundSessionId: session?.sessionId ?? '',
+        boundLabel: session === null ? '' : label(session.sessionId),
+        screenSessionId,
+        screenLabel: screenSessionId === '' ? '' : label(screenSessionId),
+        onScreen: session !== null && screenSessionId !== '' && screenSessionId === session.sessionId,
+        overlayOpen,
+        inCall: session?.inCall === true,
+        busy: session?.busy === true || (session?.queued ?? 0) > 0,
+        state: session?.state ?? null,
+        confirmTarget,
+        notice,
+      });
+      const emit = () => {
+        const view = snapshot();
+        for (const listener of [...listeners]) {
+          try { listener(view); } catch { /* 视图出错不影响通话 */ }
         }
-      }, [call, sessionId, t]);
+      };
 
-      /** 收到一段用户语音：入队并尝试处理（最多留最近 3 段，避免积压）。 */
-      const converse = React.useCallback((pcm) => {
-        queueRef.current.push(pcm);
-        if (queueRef.current.length > 3) queueRef.current.shift();
-        void drain();
-      }, [drain]);
+      const startIn = (sessionId) => {
+        session?.dispose();
+        session = new CallSession({
+          call,
+          sessionId,
+          t,
+          ...sounds === undefined ? {} : { sounds: sounds() },
+          ...ringTimeoutMs === undefined ? {} : { ringTimeoutMs },
+        });
+        session.subscribe(emit);
+      };
+
+      const api = {
+        subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+        snapshot,
+        get session() { return session; },
+        setMode(mode) { session?.setMode(mode); },
+        startCapture() { session?.startCapture(); },
+        stopCapture() { session?.stopCapture(); },
+        setTranslator(fn) { translator = fn; },
+        setOverlayEl(el) { overlayEl = el; },
+        setButtonEl(el) { buttonEl = el; },
+        /** 「面板外」= 浮层与输入栏按钮都不含该目标；只用来收 UI，绝不碰通话。 */
+        isInside(target) {
+          return (overlayEl?.contains?.(target) ?? false) || (buttonEl?.contains?.(target) ?? false);
+        },
+        /** 输入栏按钮上报当前屏幕会话；切对话只是这里换个值，通话不受影响。 */
+        setScreen(sessionId) {
+          const next = sessionId ?? '';
+          if (next === screenSessionId) return;
+          screenSessionId = next;
+          if (confirmTarget !== null && confirmTarget.sessionId !== next) confirmTarget = null;
+          emit();
+        },
+        /** 入口：没有通话就用按钮所在会话接通；有通话则只切换浮层显隐。 */
+        toggle(sessionId) {
+          if (session !== null && session.inCall) {
+            overlayOpen = !overlayOpen;
+            emit();
+            return session;
+          }
+          if (!sessionId) return null;
+          startIn(sessionId);
+          overlayOpen = true;
+          emit();
+          void session.openPanel();
+          return session;
+        },
+        closeOverlay() { if (overlayOpen) { overlayOpen = false; emit(); } },
+        /** 「接到当前对话」：只弹出确认，绝不在这里换绑。 */
+        requestRebind() {
+          if (session === null || !session.inCall) return false;
+          if (screenSessionId === '' || screenSessionId === session.sessionId) return false;
+          confirmTarget = { sessionId: screenSessionId, label: label(screenSessionId), from: label(session.sessionId) };
+          notice = '';
+          emit();
+          return true;
+        },
+        cancelRebind() { if (confirmTarget !== null) { confirmTarget = null; emit(); } },
+        /** 确认后才真的换绑；排队/在飞时拒绝，避免把旧会话的语音串到新会话。 */
+        async confirmRebind() {
+          if (confirmTarget === null || session === null) return false;
+          if (session.busy || session.queued > 0) { notice = t('waitTurn'); emit(); return false; }
+          const target = confirmTarget.sessionId;
+          confirmTarget = null;
+          const ok = await session.rebind(target);
+          notice = ok ? '' : t('rebindFailed');
+          emit();
+          return ok;
+        },
+        hangUp() {
+          confirmTarget = null;
+          notice = '';
+          overlayOpen = false;
+          session?.hangUp();
+          emit();
+        },
+        dispose() { session?.dispose(); session = null; listeners.clear(); },
+      };
+      return api;
+    }
+
+    // ---------------------------------------------------------------- 通话浮层（root）
+    function CallOverlay({ center, t }) {
+      const panelRef = React.useRef(null);
+      const [view, setView] = React.useState(center.snapshot());
+      React.useEffect(() => {
+        center.setTranslator(t);
+        return center.subscribe(setView);
+      }, [center, t]);
+      React.useEffect(() => { center.setOverlayEl(panelRef.current); return () => center.setOverlayEl(null); });
 
       React.useEffect(() => {
-        let disposed = false;
-        // 空闲时轮询「迟到回复」：agent 答得慢时，真实结果会以这种方式补播
-        const poll = setInterval(async () => {
-          if (disposed || busyRef.current) return;
-          const engine = engineRef.current;
-          if (!engine || engine.state !== 'idle') return;
-          try {
-            const res = unwrap(await call.poll({ sessionId }));
-            for (const chunk of res?.chunks ?? []) engine.play(b64.toPcm(chunk));
-          } catch { /* 轮询失败忽略，下一次再试 */ }
-        }, 3000);
+        if (view.overlayOpen !== true || view.confirmTarget !== null) return;
+        // 点浮层/按钮之外只收起 UI —— 绝不碰通话；有确认框时不收起，避免误关
+        const onDocClick = (e) => { if (!center.isInside(e.target)) center.closeOverlay(); };
+        const onEsc = (e) => { if (e.key === 'Escape') center.closeOverlay(); };
+        document.addEventListener('mousedown', onDocClick);
+        document.addEventListener('keydown', onEsc);
+        return () => { document.removeEventListener('mousedown', onDocClick); document.removeEventListener('keydown', onEsc); };
+      }, [center, view.overlayOpen, view.confirmTarget]);
 
-        const engine = new CallEngine((ev) => {
-          if (disposed) return;
-          if (ev.type === 'level') setLevel(ev.level);
-          if (ev.type === 'state') {
-            if (ev.state === 'recording') setStatus(t('listening'));
-            if (ev.state === 'speaking') setStatus(t('speaking'));
-            if (ev.state === 'idle') setStatus(t('live'));
-          }
-          if (ev.type === 'utterance') void converse(ev.pcm);
-          if (ev.type === 'bargeIn') { void call.cancel(); engine.stopPlayback(); }
-        });
-        engineRef.current = engine;
-        (async () => {
-          try {
-            if (!sessionId) throw new Error(t('noSession'));
-            let started = unwrap(await call.start({ sessionId }));
-            // 首次使用：宿主会先把识别与合成模型下载好（检测若空就下载），
-            // 这里把进度显示出来，下完自动接通。
-            while (started?.provisioning === true) {
-              if (disposed) return;
-              const p = started.progress ?? {};
-              setPhase('provisioning');
-              setDownload(p);
-              setStatus(`${t('preparingModels')} ${p.label ?? ''} ${p.percent ?? 0}%`.trim());
-              await new Promise((r) => setTimeout(r, 1500));
-              if (disposed) return;
-              const st = unwrap(await call.provision());
-              if (st?.phase === 'failed') throw new Error(`${t('provisionFailed')}：${st.detail ?? ''}`);
-              started = st?.phase === 'ready'
-                ? unwrap(await call.start({ sessionId }))
-                : { provisioning: true, progress: st };
-            }
-            await engine.open();
-            if (!disposed) { setPhase('live'); setStatus(t('live')); }
-            // 接通问候由宿主合成，播放它即证明「说」的通路正常
-            if (started?.greeting) engine.play(b64.toPcm(started.greeting));
-          } catch (e) {
-            if (!disposed) { setPhase('error'); setStatus(`${t('error')}: ${e.message}`); }
-          }
-        })();
-        return () => {
-          disposed = true;
-          clearInterval(poll);
-          engine.close();
-          void call.stop();
-        };
-      }, [call, sessionId, converse, t]);
+      // 没有通话或用户收起时什么都不画（组件本身是 root 的，切对话不会卸载它）
+      if (view.overlayOpen !== true || view.state === null) return null;
+      const { status, level, mode, transcript, reply, phase, elapsedSec } = view.state;
+      const callerName = view.boundLabel !== '' ? view.boundLabel : t('assistantName');
+      const calling = phase === 'dialing' || phase === 'provisioning';
+      const clock = `${String(Math.floor(elapsedSec / 60)).padStart(2, '0')}:${String(elapsedSec % 60).padStart(2, '0')}`;
 
-      const toggleMode = () => {
-        const next = mode === 'ptt' ? 'auto' : 'ptt';
-        setMode(next);
-        engineRef.current?.setMode(next);
-        setStatus(next === 'auto' ? t('autoOn') : t('pttOn'));
-      };
+      const bindArea = view.screenSessionId === ''
+        ? h('div', { style: hintStyle }, `${t('noConversation')} · ${t('attachedTo')} ${view.boundLabel}`)
+        : view.onScreen
+          ? h('div', { style: hintStyle }, `${t('sameConversation')} · ${t('attachedTo')} ${view.boundLabel}`)
+          : h('div', { style: warnStyle },
+              h('div', null, `⚠ ${t('hereIsOther')}`),
+              h('div', null, `${t('speechGoesTo')} ${view.boundLabel}`),
+              h('button', { type: 'button', style: { ...smallBtn, marginTop: 6 },
+                onClick: () => center.requestRebind() }, t('moveToCurrent')));
 
-      const pttDown = () => { engineRef.current?.stopPlayback(); engineRef.current?.startCapture(); };
-      const pttUp = () => {
-        const pcm = engineRef.current?.stopCapture();
-        if (pcm && pcm.length > TARGET_RATE * 0.2) void converse(pcm);
-      };
+      const confirmArea = view.confirmTarget === null ? null : h('div', { style: confirmStyle },
+        h('div', null, `${t('moveConfirmPrefix')} ${view.confirmTarget.from} ${t('moveConfirmMiddle')} ${view.confirmTarget.label}？`),
+        view.notice !== '' && h('div', { style: { marginTop: 4, color: '#b42318' } }, view.notice),
+        h('div', { style: rowStyle },
+          h('button', { type: 'button', style: smallBtn, onClick: () => { void center.confirmRebind(); } }, t('confirm')),
+          h('button', { type: 'button', style: smallBtn, onClick: () => center.cancelRebind() }, t('cancel'))));
 
-      return h('div', { style: panelStyle, onClick: (e) => e.stopPropagation() },
-        h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-          h('strong', null, t('title')),
-          h('button', { type: 'button', 'aria-label': t('close'), onClick: onClose,
+      return h('div', { ref: panelRef, style: overlayStyle, onClick: (e) => e.stopPropagation() },
+        h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+          // 呼叫中就报「正在呼叫〈会话标题〉」，接通后显示通话中 + 计时
+          h('strong', null, calling ? `${t('dialing')} ${callerName}` : t('title')),
+          h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } },
+            phase === 'live' ? `${clock} · ${t('attachedTo')} ${callerName}` : `${t('attachedTo')} ${callerName}`),
+          h('button', { type: 'button', 'aria-label': t('close'), onClick: () => center.closeOverlay(),
             style: { border: 'none', background: 'transparent', cursor: 'pointer', color: 'inherit', fontSize: 14 } }, '×')),
         h('div', { style: { marginTop: 6, color: 'var(--dsw-alias-label-secondary, #666)' } }, status),
         h('div', { style: { marginTop: 8, height: 6, borderRadius: 3, background: 'var(--dsw-alias-border-l1, #ddd)', overflow: 'hidden' } },
           h('div', { style: { width: `${Math.min(100, Math.round((level / 0.15) * 100))}%`, height: '100%', background: 'var(--dsw-alias-brand-primary, #3b82f6)', transition: 'width .06s linear' } })),
+        bindArea,
+        confirmArea,
         mode === 'ptt'
           ? h('button', {
               type: 'button', disabled: phase !== 'live',
-              onPointerDown: pttDown, onPointerUp: pttUp, onPointerLeave: pttUp,
+              onPointerDown: () => center.startCapture(), onPointerUp: () => center.stopCapture(), onPointerLeave: () => center.stopCapture(),
               style: { ...smallBtn, marginTop: 10, width: '100%', padding: '14px 10px', background: 'var(--dsw-alias-interactive-bg-hover, #f2f4f7)' },
             }, t('holdToTalk'))
           : h('div', { style: { ...rowStyle, color: 'var(--dsw-alias-label-secondary, #666)' } }, t('autoHint')),
         h('div', { style: rowStyle },
-          h('button', { type: 'button', style: smallBtn, onClick: toggleMode }, mode === 'ptt' ? t('switchToAuto') : t('switchToPtt')),
-          h('button', { type: 'button', style: smallBtn, onClick: onClose }, t('hangUp'))),
+          h('button', { type: 'button', style: smallBtn, onClick: () => center.setMode(mode === 'ptt' ? 'auto' : 'ptt') }, mode === 'ptt' ? t('switchToAuto') : t('switchToPtt')),
+          h('button', { type: 'button', style: smallBtn, onClick: () => center.hangUp() }, t('hangUp'))),
         transcript !== '' && h('div', { style: { ...rowStyle, display: 'block', color: 'var(--dsw-alias-label-secondary, #666)' } }, `${t('you')}: ${transcript}`),
         reply !== '' && h('div', { style: { ...rowStyle, display: 'block' } }, `${t('agent')}: ${reply}`));
     }
 
     // ---------------------------------------------------------------- 通话按钮
-    function CallButton({ call, sessionId, t }) {
-      const [open, setOpen] = React.useState(false);
+    function CallButton({ call, center, sessionId, t }) {
       const wrapRef = React.useRef(null);
-
+      const [view, setView] = React.useState(center.snapshot());
       React.useEffect(() => {
-        if (!open) return;
-        const onDocClick = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
-        const onEsc = (e) => { if (e.key === 'Escape') setOpen(false); };
-        document.addEventListener('mousedown', onDocClick);
-        document.addEventListener('keydown', onEsc);
-        return () => { document.removeEventListener('mousedown', onDocClick); document.removeEventListener('keydown', onEsc); };
-      }, [open]);
+        center.setTranslator(t);
+        return center.subscribe(setView);
+      }, [center, t]);
+
+      // 上报「屏幕上正在看的会话」：切对话只是换这个值，通话与浮层都不受影响
+      React.useEffect(() => { center.setScreen(sessionId ?? ''); }, [center, sessionId]);
+      React.useEffect(() => { center.setButtonEl(wrapRef.current); return () => center.setButtonEl(null); });
+
+      // 注意：这里**没有**卸载回收。按钮是 session 作用域的，切对话就会卸载，
+      // 通话的回收只归 center（插件级 effect）与显式挂断，见 apply()。
+      const open = view.overlayOpen;
+      const inCall = view.inCall;
+      const elsewhere = inCall && view.screenSessionId !== '' && view.boundSessionId !== view.screenSessionId;
+
+      const onToggle = () => {
+        if (!inCall && (sessionId ?? '') === '') return;   // 首页没有会话时不能起呼
+        center.toggle(sessionId ?? '');
+      };
+
+      const title = inCall
+        ? (elsewhere
+            ? `${t('button')} · ${t('live')} · ${t('attachedTo')} ${view.boundLabel}`
+            : `${t('button')} · ${t('live')}`)
+        : (sessionId ? t('button') : t('noSession'));
 
       return h('div', { ref: wrapRef, style: { position: 'relative', display: 'inline-flex' } },
         h('button', {
-          type: 'button', 'aria-label': t('button'), 'aria-pressed': open,
-          title: sessionId ? t('button') : t('noSession'), onClick: () => setOpen((v) => !v),
+          type: 'button', 'aria-label': t('button'), 'aria-pressed': open || inCall, title, onClick: onToggle,
           style: {
+            position: 'relative',
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 28, height: 28,
             padding: 0, border: 'none', borderRadius: 'var(--dsw-radius-sm, 6px)', cursor: 'pointer',
             background: open ? 'var(--dsw-alias-interactive-bg-active, #eaeef5)' : 'transparent',
-            color: open ? 'var(--dsw-alias-brand-primary, #3b82f6)' : 'var(--dsw-alias-label-secondary, #666)',
+            color: (open || inCall)
+              ? (elsewhere ? '#d97706' : 'var(--dsw-alias-brand-primary, #3b82f6)')
+              : 'var(--dsw-alias-label-secondary, #666)',
           },
-        }, h(IconCall, { active: open })),
-        open && h(CallPanel, { call, sessionId, t, onClose: () => setOpen(false) }));
+        }, h(IconCall, { active: open || inCall }),
+        // 通话进行中：留一个明确的标记；通话挂在别的会话时用琥珀色提示
+        inCall && h('span', {
+          'aria-hidden': true,
+          style: {
+            position: 'absolute', top: 2, right: 2, width: 7, height: 7, borderRadius: '50%',
+            background: elsewhere ? '#d97706' : 'var(--dsw-alias-brand-primary, #3b82f6)',
+            boxShadow: '0 0 0 2px var(--dsw-alias-bg-layer-2, #fff)',
+          },
+        })));
     }
 
     return {
       // 只依赖槽位与词典；控制通道走同源路由，不占用 DSH 的 remote 命名空间
       inject: ['slots', 'locale'],
-      // 测试缝：脱离麦克风验证端点检测状态机（加载器只读 inject/apply，多余字段无副作用）
-      __internals: { createEndpointDetector, b64 },
+      // 测试缝：脱离麦克风验证端点检测状态机、通话会话与换绑
+      //（加载器只读 inject/apply，多余字段无副作用）
+      __internals: { createEndpointDetector, b64, CallSession, createCallCenter, createCallSounds },
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, {
           zh: {
@@ -493,20 +944,48 @@ window.__ModuleLoader__.load({
             connecting: '正在接入…', live: '通话中', listening: '在听…', thinking: '正在思考…',
             speaking: '正在说话…', error: '通话出错', holdToTalk: '按住说话',
             switchToAuto: '切到连续对话', switchToPtt: '切到按住说话',
-            autoOn: '连续对话：直接说话即可', pttOn: '按住说话', autoHint: '连续对话中：直接说话，静音约 0.7 秒即自动发送',
+            autoOn: '连续对话：直接说话即可', pttOn: '按住说话', autoHint: '连续对话中：直接说话，静音约 3 秒即自动发送',
             you: '你说', agent: '助手', lang: 'zh', queued: '上一轮还没回来，已排队',
             noSession: '拿不到当前会话 ID（插件槽位未提供 sessionId）',
+            attachedTo: '附着在', sameConversation: '已连接当前对话', noConversation: '当前不在任何对话中',
+            hereIsOther: '当前显示的是另一个对话', speechGoesTo: '你在这里说话会发给：',
+            moveToCurrent: '接到当前对话', moveConfirmPrefix: '把通话从', moveConfirmMiddle: '接到',
+            confirm: '确认', cancel: '取消', rebound: '已接到当前对话',
+            rebindFailed: '换绑失败，仍挂在原对话', waitTurn: '正在处理上一句，稍后再切换',
+            dialing: '正在呼叫', noAnswer: '无法接通（对方无响应）', assistantName: 'DSH 助手',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
             connecting: 'Connecting…', live: 'On call', listening: 'Listening…', thinking: 'Thinking…',
             speaking: 'Speaking…', error: 'Call error', holdToTalk: 'Hold to talk',
             switchToAuto: 'Switch to continuous', switchToPtt: 'Switch to push-to-talk',
-            autoOn: 'Continuous: just talk', pttOn: 'Push to talk', autoHint: 'Continuous mode: speak freely; ~0.7s of silence sends',
+            autoOn: 'Continuous: just talk', pttOn: 'Push to talk', autoHint: 'Continuous mode: speak freely; ~3s of silence sends',
             you: 'You', agent: 'Agent', lang: 'en', queued: 'Queued behind the current turn…',
             noSession: 'No session id from the slot (plugin cannot attach to a conversation)',
+            attachedTo: 'attached to', sameConversation: 'Connected to this conversation', noConversation: 'No conversation is open',
+            hereIsOther: 'You are viewing a different conversation', speechGoesTo: 'Anything you say here goes to:',
+            moveToCurrent: 'Move to this conversation', moveConfirmPrefix: 'Move this call from', moveConfirmMiddle: 'to',
+            confirm: 'Confirm', cancel: 'Cancel', rebound: 'Moved to this conversation',
+            rebindFailed: 'Move failed; still attached to the previous conversation', waitTurn: 'Still processing your last sentence — try again in a moment',
+            dialing: 'Calling', noAnswer: 'Could not connect (no answer)', assistantName: 'DSH Assistant',
           },
         }), 'dsh-call-mode: dictionaries');
+
+        // 会话标题：sessions 服务在就取 displayTitle，取不到退回短 id。
+        // 用 ctx.get 而不是把 'sessions' 写进 inject——名字若有出入也不会让插件挂掉。
+        const label = (sessionId) => {
+          if (!sessionId) return '';
+          try {
+            const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined;
+            const title = sessions?.list?.getSnapshot?.().byId?.[sessionId]?.displayTitle;
+            if (typeof title === 'string' && title !== '') return title;
+          } catch { /* 服务不可用就退回短 id */ }
+          return sessionId.length > 18 ? `${sessionId.slice(0, 14)}…` : sessionId;
+        };
+        const center = createCallCenter({ call: httpCall, label });
+
+        // 通话的回收只挂在这里（插件/页面真卸载）；切对话、收起浮层都不回收
+        ctx.effect(() => () => center.dispose(), 'dsh-call-mode: 通话回收');
 
         // 握手：宿主会把它记进 call.log，这样「按钮没出现」时也能远程定位到哪一步。
         // 注意：诊断本身绝不能抛异常，否则会把整个插件挂掉（曾因裸 location 全局踩过）。
@@ -519,7 +998,17 @@ window.__ModuleLoader__.load({
           });
         } catch { /* 诊断失败忽略 */ }
 
-        // 放在输入栏工具条（list 型槽位，不与语音插件的 single 麦克风位冲突）
+        // 通话浮层：root 作用域的 shell.overlay（kind=list, scope=root），切对话不卸载，
+        // 首页等没有会话的界面照样在。UI 与内核都活在 center 里。
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: 'dsh-call-mode-call',
+          order: 30,
+          locale: NS,
+          inject: () => ({ center }),
+        }, CallOverlay));
+
+        // 输入栏按钮：入口 + 状态指示（list 型槽位，不与语音插件的 single 麦克风位冲突）
         ctx.slots.inject('conversation.input.right', () => {
           try { httpCall.hello({ stage: 'slot-declared' }); } catch { /* 忽略 */ }
           return ctx.slots.register({
@@ -527,7 +1016,7 @@ window.__ModuleLoader__.load({
             id: 'dsh-call-mode',
             order: 20,
             locale: NS,
-            inject: () => ({ call: httpCall }),
+            inject: () => ({ call: httpCall, center }),
           }, CallButton);
         });
       },

@@ -24,9 +24,31 @@ export const STT_MODEL = { name: 'model.int8.onnx', bytes: 239233841, sha256: 'c
 export const STT_TOKENS = { name: 'tokens.txt', bytes: 315894, sha256: 'f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc' };
 export const VAD_MODEL = { name: 'silero_vad.onnx', bytes: 1807522, sha256: 'a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28' };
 
-/** TTS（MatchaTTS zh-en，16kHz）。 */
+/** TTS 默认引擎（Kokoro 多语言 v1.1，24kHz、103 音色、中英混读，Apache-2.0）。 */
+export const KOKORO_ARCHIVE = {
+  file: 'kokoro-multi-lang-v1_1.tar.bz2',
+  url: `${GH}/tts-models/kokoro-multi-lang-v1_1.tar.bz2`,
+  bytes: 364816464,
+  sha256: 'a3f4c73d043860e3fd2e5b06f36795eb81de0fc8e8de6df703245edddd87dbad',
+  innerDir: 'kokoro-multi-lang-v1_1',
+};
+export const KOKORO_MODEL = { name: 'model.onnx', bytes: 325631784, sha256: 'acc4adc175b9d9986106cd20060329673ad5a2e12ef3c557d2d3745b694f8b38' };
+export const KOKORO_VOICES = { name: 'voices.bin', bytes: 53790720, sha256: 'e64a5a581d8c2a350d848f51c3121657cd83aa07ed6109172177345874a7244c' };
+export const KOKORO_TOKENS = { name: 'tokens.txt', bytes: 1111, sha256: '931ab2df2400cd65d580a22402024c2347ced8ae9ea300e545144b1aacc48e14' };
+export const KOKORO_LEXICON_US = { name: 'lexicon-us-en.txt', bytes: 5956885, sha256: '7daaab53a181be9885b853a8582bf1838186317e5dadacbcef9c426d6fa0da14' };
+export const KOKORO_LEXICON_ZH = { name: 'lexicon-zh.txt', bytes: 2119465, sha256: '11111d8cd695fba2ace1367a1d0a708b586e6ef5c1f9be91da5d7eef129b651c' };
+
+/** TTS 回退引擎（MatchaTTS zh-en，16kHz，音色单薄但首块延迟极低）。 */
 export const TTS_ACOUSTIC = { name: 'model-steps-3.onnx', bytes: 75717082, sha256: '524286bf6cf11be74329ae1c682ac69e34d6860c2ea9fd1290319d561540b16a' };
 export const TTS_VOCODER = { name: 'vocos-16khz-univ.onnx', bytes: 53882848, sha256: 'b599142a1fb8ff03de3e84ac35ff537c619e56f4267a6fe894851a42844acf9e' };
+
+/**
+ * 当前 TTS 引擎：`matcha`（默认，旧方案，首块延迟几十毫秒）| `kokoro`（可选，音色更好）。
+ * 宿主（index.js）与子进程（worker.mjs）读同一个环境变量，模型准备与推理必须一致。
+ */
+export function ttsEngine() {
+  return String(process.env.DSH_TTS_ENGINE || 'matcha').toLowerCase() === 'kokoro' ? 'kokoro' : 'matcha';
+}
 
 const STT_TAR = {
   file: 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2',
@@ -47,12 +69,15 @@ const TTS_TAR = {
 for (const [label, sha] of [
   ['STT_MODEL', STT_MODEL.sha256], ['STT_TOKENS', STT_TOKENS.sha256], ['VAD_MODEL', VAD_MODEL.sha256],
   ['TTS_ACOUSTIC', TTS_ACOUSTIC.sha256], ['TTS_VOCODER', TTS_VOCODER.sha256], ['TTS_TAR', TTS_TAR.sha256],
+  ['KOKORO_ARCHIVE', KOKORO_ARCHIVE.sha256], ['KOKORO_MODEL', KOKORO_MODEL.sha256], ['KOKORO_VOICES', KOKORO_VOICES.sha256],
+  ['KOKORO_TOKENS', KOKORO_TOKENS.sha256], ['KOKORO_LEXICON_US', KOKORO_LEXICON_US.sha256], ['KOKORO_LEXICON_ZH', KOKORO_LEXICON_ZH.sha256],
 ]) {
   if (!/^[0-9a-f]{64}$/.test(sha)) throw new Error(`models.mjs: ${label}.sha256 必须是 64 位小写十六进制，实际长度 ${sha?.length}`);
 }
 
 /** 各文件在插件模型目录里的落点。 */
 export function targetPaths(root) {
+  const k = path.join(root, KOKORO_ARCHIVE.innerDir);
   return {
     sttModel: path.join(root, 'sensevoice', STT_MODEL.name),
     sttTokens: path.join(root, 'sensevoice', STT_TOKENS.name),
@@ -60,7 +85,25 @@ export function targetPaths(root) {
     ttsDir: path.join(root, TTS_TAR.innerDir),
     ttsModel: path.join(root, TTS_TAR.innerDir, TTS_ACOUSTIC.name),
     vocoder: path.join(root, TTS_VOCODER.name),
+    kokoroDir: k,
+    kokoroModel: path.join(k, KOKORO_MODEL.name),
+    kokoroVoices: path.join(k, KOKORO_VOICES.name),
+    kokoroTokens: path.join(k, KOKORO_TOKENS.name),
+    kokoroLexiconUs: path.join(k, KOKORO_LEXICON_US.name),
+    kokoroLexiconZh: path.join(k, KOKORO_LEXICON_ZH.name),
   };
+}
+
+/** Kokoro 的六个关键文件全部有效才算就绪（其余资源随同一个 tar 包解出）。 */
+async function kokoroReady(t) {
+  return (await Promise.all([
+    isValid(t.kokoroModel, KOKORO_MODEL),
+    isValid(t.kokoroVoices, KOKORO_VOICES),
+    isValid(t.kokoroTokens, KOKORO_TOKENS),
+    isValid(t.kokoroLexiconUs, KOKORO_LEXICON_US),
+    isValid(t.kokoroLexiconZh, KOKORO_LEXICON_ZH),
+    isValid(path.join(t.kokoroDir, 'espeak-ng-data', 'phontab'), {}),
+  ])).every(Boolean);
 }
 
 /** DSH 自带语音插件的缓存（存在且有效就复用，不必重复下载 240MB）。 */
@@ -80,6 +123,12 @@ export function resolvePaths(root) {
     ttsDir: t.ttsDir,
     ttsModel: t.ttsModel,
     vocoder: t.vocoder,
+    kokoroDir: t.kokoroDir,
+    kokoroModel: t.kokoroModel,
+    kokoroVoices: t.kokoroVoices,
+    kokoroTokens: t.kokoroTokens,
+    kokoroLexiconUs: t.kokoroLexiconUs,
+    kokoroLexiconZh: t.kokoroLexiconZh,
   };
 }
 
@@ -233,33 +282,54 @@ export async function ensureModels({ root, log = () => {}, onProgress = () => {}
   }
   nextStep();
 
-  // 3) 合成模型（MatchaTTS 声学模型 + lexicon + tokens + espeak 数据）
-  const ttsOk = await isValid(t.ttsModel, TTS_ACOUSTIC);
-  if (ttsOk) { log('合成模型已存在，跳过下载'); reused += 1; }
-  else {
-    const archive = path.join(tmp, TTS_TAR.file);
-    const ok = await download({ ...TTS_TAR, file: archive, label: '合成模型', log, onProgress: (p) => report('合成模型', p.percent, p.detail) });
-    if (!ok) missing.push('合成模型');
+  // 3) 合成模型：默认 MatchaTTS（首块快）；DSH_TTS_ENGINE=kokoro 时才准备 Kokoro。
+  //    两者互斥：没选中的那个引擎即使一个文件都没有，也不影响就绪判定。
+  const engine = ttsEngine();
+  if (engine === 'kokoro') {
+    if (await kokoroReady(t)) { log('合成模型已存在（Kokoro），跳过下载'); reused += 1; }
     else {
-      await extractTar(archive, root, log);
-      fs.rmSync(archive, { force: true });
-      if (await isValid(t.ttsModel, TTS_ACOUSTIC)) downloaded += 1;
-      else missing.push('合成模型校验');
+      const archive = path.join(tmp, KOKORO_ARCHIVE.file);
+      const ok = await download({ ...KOKORO_ARCHIVE, file: archive, label: '合成模型(Kokoro)', log, onProgress: (p) => report('合成模型(Kokoro)', p.percent, p.detail) });
+      if (!ok) missing.push('合成模型(Kokoro)');
+      else {
+        await extractTar(archive, root, log);
+        fs.rmSync(archive, { force: true });
+        if (await kokoroReady(t)) downloaded += 1;
+        else missing.push('合成模型(Kokoro)校验');
+      }
     }
-  }
-  nextStep();
+    nextStep();
+    // 4) Kokoro 音色库（voices.bin）与声学模型同包，无需单独声码器
+    log('Kokoro 音色库随合成模型一起解出，无需单独下载声码器');
+    nextStep();
+  } else {
+    const ttsOk = await isValid(t.ttsModel, TTS_ACOUSTIC);
+    if (ttsOk) { log('合成模型已存在，跳过下载'); reused += 1; }
+    else {
+      const archive = path.join(tmp, TTS_TAR.file);
+      const ok = await download({ ...TTS_TAR, file: archive, label: '合成模型', log, onProgress: (p) => report('合成模型', p.percent, p.detail) });
+      if (!ok) missing.push('合成模型');
+      else {
+        await extractTar(archive, root, log);
+        fs.rmSync(archive, { force: true });
+        if (await isValid(t.ttsModel, TTS_ACOUSTIC)) downloaded += 1;
+        else missing.push('合成模型校验');
+      }
+    }
+    nextStep();
 
-  // 4) 声码器
-  if (await isValid(t.vocoder, TTS_VOCODER)) { log('声码器已存在，跳过下载'); reused += 1; }
-  else {
-    const ok = await download({
-      url: `${GH}/vocoder-models/${TTS_VOCODER.name}`,
-      file: t.vocoder, bytes: TTS_VOCODER.bytes, sha256: TTS_VOCODER.sha256,
-      label: '声码器', log, onProgress: (p) => report('声码器', p.percent, p.detail),
-    });
-    if (ok) downloaded += 1; else missing.push('声码器');
+    // 4) 声码器
+    if (await isValid(t.vocoder, TTS_VOCODER)) { log('声码器已存在，跳过下载'); reused += 1; }
+    else {
+      const ok = await download({
+        url: `${GH}/vocoder-models/${TTS_VOCODER.name}`,
+        file: t.vocoder, bytes: TTS_VOCODER.bytes, sha256: TTS_VOCODER.sha256,
+        label: '声码器', log, onProgress: (p) => report('声码器', p.percent, p.detail),
+      });
+      if (ok) downloaded += 1; else missing.push('声码器');
+    }
+    nextStep();
   }
-  nextStep();
 
   // 5) 清理临时目录
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -278,12 +348,21 @@ export async function checkModels(root) {
   const sttModel = (await isValid(path.join(cache, 'sensevoice-onnx', STT_MODEL.name), STT_MODEL)) ? path.join(cache, 'sensevoice-onnx', STT_MODEL.name) : t.sttModel;
   const sttTokens = (await isValid(path.join(cache, 'sensevoice-onnx', STT_TOKENS.name), STT_TOKENS)) ? path.join(cache, 'sensevoice-onnx', STT_TOKENS.name) : t.sttTokens;
   const vad = (await isValid(path.join(cache, 'silero', VAD_MODEL.name), VAD_MODEL)) ? path.join(cache, 'silero', VAD_MODEL.name) : t.vad;
+  const engine = ttsEngine();
   const items = {
     识别权重: await isValid(sttModel, STT_MODEL),
     词表: await isValid(sttTokens, STT_TOKENS),
     语音检测: await isValid(vad, VAD_MODEL),
-    合成声学: await isValid(t.ttsModel, TTS_ACOUSTIC),
-    声码器: await isValid(t.vocoder, TTS_VOCODER),
+    ...(engine === 'kokoro'
+      ? {
+        合成模型: await isValid(t.kokoroModel, KOKORO_MODEL),
+        音色库: await isValid(t.kokoroVoices, KOKORO_VOICES),
+        中英词表: (await isValid(t.kokoroLexiconUs, KOKORO_LEXICON_US)) && (await isValid(t.kokoroLexiconZh, KOKORO_LEXICON_ZH)),
+      }
+      : {
+        合成声学: await isValid(t.ttsModel, TTS_ACOUSTIC),
+        声码器: await isValid(t.vocoder, TTS_VOCODER),
+      }),
   };
-  return { ready: Object.values(items).every(Boolean), items };
+  return { ready: Object.values(items).every(Boolean), items, engine };
 }
