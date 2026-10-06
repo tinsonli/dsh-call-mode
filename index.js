@@ -76,6 +76,16 @@ const DEFAULT_REPLY_TIMEOUT_MS = 8000;
  */
 const DEFAULT_STILL_WORKING_TEXT = '';
 
+/**
+ * 静默心跳（task-22）：后台确实有事在跑、且通话静默超过 20s，才主动出个声——
+ * **极短、低频、可关**。用户对通话里话多非常敏感，所以默认话术只有 4 个字；
+ * 「同状态不重复」由签名控制：进展没变化就不再出声，一旦有新进展才重新允许。
+ */
+const DEFAULT_HEARTBEAT_AFTER_MS = 20000;
+const DEFAULT_HEARTBEAT_MIN_INTERVAL_MS = 15000;
+const DEFAULT_HEARTBEAT_TEXT = '还在弄。';
+const HEARTBEAT_TICK_MS = 5000;
+
 /** 毫秒解析：只认正的有限数字；其余（undefined / NaN / 0 / 负数 / 非数字串）一律回落到 fallback。 */
 function positiveMs(value, fallback) {
   const n = Number(value);
@@ -275,6 +285,18 @@ class CallController {
     this.stillWorkingText = config?.stillWorkingText ?? process.env.DSH_CALL_STILL_WORKING_TEXT ?? DEFAULT_STILL_WORKING_TEXT;
     // 转写专名修正：默认表保守，config.transcriptFixes（{ '错法': '正确写法' }）可追加
     this.transcriptFixes = compileTranscriptFixes(config?.transcriptFixes);
+    // ---- 通话状态区（看得见）与静默心跳（听得见，但要克制）----
+    this.toolActions = [];              // 最近观察到的工具动作 [{ name, at }]
+    this.toolActionCount = 0;           // 单调计数，用作心跳签名（数组会被裁剪）
+    this.lastAssistantText = '';        // 最近一轮助手文本（状态区短摘要）
+    this.lastActivityAt = 0;            // 最近一次「有进展」的时刻
+    this.heartbeatTimer = null;
+    this.lastHeartbeatAt = 0;
+    this.lastHeartbeatSignature = '';
+    this.heartbeatOnCall = config?.heartbeatOnCall !== false;
+    this.heartbeatText = config?.heartbeatText ?? process.env.DSH_CALL_HEARTBEAT_TEXT ?? DEFAULT_HEARTBEAT_TEXT;
+    this.heartbeatAfterMs = positiveMs(config?.heartbeatAfterMs ?? process.env.DSH_CALL_HEARTBEAT_AFTER_MS, DEFAULT_HEARTBEAT_AFTER_MS);
+    this.heartbeatMinIntervalMs = positiveMs(config?.heartbeatMinIntervalMs, DEFAULT_HEARTBEAT_MIN_INTERVAL_MS);
     this.child = undefined;
     this.port = undefined;
     this.token = undefined;
@@ -405,6 +427,7 @@ class CallController {
     });
     this.port = port;
     this.subscribeEvents();
+    this.#startHeartbeat();
     log('worker 就绪 port=', port, 'pid=', child.pid);
     if (sessionId !== undefined) await this.activateRules(sessionId);
     return { port, pid: child.pid };
@@ -421,6 +444,10 @@ class CallController {
     this.pendingSpeech.clear();
     this.unpromptedDraft.clear();
     this.handoffSent.clear();      // 通话结束：下次接通允许再推一次让位
+    // 挂断即停心跳（定时器清理干净，不泄漏），并让下一通能重新心跳
+    if (this.heartbeatTimer !== null) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+    this.lastHeartbeatAt = 0;
+    this.lastHeartbeatSignature = '';
     // 每条请求各自一格登记（M2）：超时过的那条（delivered）留着等真实结果补播；没超时的直接失败收尾。
     for (const [id, list] of this.pending) {
       for (const p of list) {
@@ -619,6 +646,7 @@ class CallController {
   // ------------------------------------------------------------- 会话
   async submitTurn(sessionId, text, options = {}) {
     const timeoutMs = positiveMs(options.timeoutMs, this.replyTimeoutMs);
+    this.lastActivityAt = Date.now();      // 用户开口也算「有活动」，心跳计时从此重新起算
     // 【C】迟到的回复只在「用户还在等它」时才有价值：这条新请求说明用户已经翻篇，
     // 该会话里还没播出的迟到回复整队作废（近似做法 = 直接清空 pendingSpeech）。
     // 取舍：无法精确判断每段迟到语音对应哪一问，宁可少念一句，也不要让他先听到一堆过期答案。
@@ -710,6 +738,10 @@ class CallController {
   subscribeEvents() {
     if (this.disposeEvent) return;
     this.disposeEvent = this.ctx.on('session/event', (session, event) => {
+      // 状态区（只看不播）：任何回合进展都算「有活动」，用来判断通话静默了多久
+      if (event.type === 'turn/start' || event.type === 'turn/end' || event.type === 'assistant/message') {
+        this.lastActivityAt = Date.now();
+      }
       // 只记录「是否有回合在飞」：提交时若已有回合，就要等它之后的那一轮。
       if (event.type === 'turn/start' || event.type === 'turn/end') {
         const turn = event.data?.turn;
@@ -728,6 +760,13 @@ class CallController {
         const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
         // 记录工具调用：通话里 agent 到底在说话还是在干活，只有这里看得见
         const tools = blocks.filter((b) => b.type === 'tool-call').map((b) => b.name);
+        // 状态区（看得见，不念）：滚动记录最近工具动作 + 最近一段助手文本
+        if (tools.length > 0) {
+          const at = Date.now();
+          for (const name of tools) { this.toolActions.push({ name, at }); this.toolActionCount += 1; }
+          if (this.toolActions.length > 30) this.toolActions.splice(0, this.toolActions.length - 30);
+        }
+        if (text !== '') this.lastAssistantText = text;
         if (owner !== undefined || this.#tracksUnprompted(session.id)) {
           log(`回合中助手消息 turn=${event.data.turn} step=${event.data.step ?? '-'} 文本=${text.length}字${tools.length ? ` 工具=[${tools.join(',')}]` : ''}`);
         }
@@ -761,6 +800,75 @@ class CallController {
       log('回合结束 turn=', event.data.turn, 'text=', text.slice(0, 60));
       owner.resolve({ text, turn: event.data.turn });
     });
+  }
+
+  /** 当前登记中的通话请求数（一个会话可以有多格，见 M2 的分格登记）。 */
+  #pendingCount() {
+    let n = 0;
+    for (const list of this.pending.values()) n += Array.isArray(list) ? list.length : 1;
+    return n;
+  }
+
+  /**
+   * 状态区（task-22）：全部来自宿主已经能看到的东西，没有新的网络/LLM 依赖。
+   * 只给浮层**看**，不会被念出来。
+   * @returns {{active:boolean,rulesActive:boolean,pending:number,inFlightTurn:number,busy:boolean,
+   *   lastActivityAt:number,lastText:string,tasks:number,teammates:number,messages:number,
+   *   tools:string[],heartbeatOnCall:boolean}}
+   */
+  status() {
+    const cutoff = Date.now() - 120000;              // 只报最近 2 分钟的工具动作
+    const recent = this.toolActions.filter((a) => a.at >= cutoff);
+    const count = (name) => recent.filter((a) => a.name === name).length;
+    const pending = this.#pendingCount();
+    return {
+      active: this.active,
+      rulesActive: this.rulesActive,
+      pending,
+      inFlightTurn: this.inFlightTurn.size,
+      busy: pending > 0 || this.inFlightTurn.size > 0,
+      lastActivityAt: this.lastActivityAt,
+      lastText: this.lastAssistantText.slice(0, 80),
+      tasks: count('team_task_create'),
+      teammates: count('spawn_teammate'),
+      messages: count('send_message'),
+      tools: recent.slice(-6).map((a) => a.name),
+      heartbeatOnCall: this.heartbeatOnCall,
+    };
+  }
+
+  /** 起心跳定时器（幂等）。随通话开始，随 #reset 清理。 */
+  #startHeartbeat() {
+    if (this.heartbeatTimer !== null || this.heartbeatOnCall !== true) return;
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), HEARTBEAT_TICK_MS);
+    if (typeof this.heartbeatTimer?.unref === 'function') this.heartbeatTimer.unref();
+  }
+
+  /**
+   * 心跳判定（克制版，定时器每 5s 调一次；导出为公开方法便于单测）：
+   *  - 后台确实有事在跑（有 pending 登记或在飞回合）才考虑出声；
+   *  - 静默要超过 heartbeatAfterMs（默认 20s）；
+   *  - 两次心跳之间不小于 heartbeatMinIntervalMs；
+   *  - **同状态不重复**：签名（pending / 工具动作数 / 最近文本长度）没变就不出声。
+   * 空闲时直接返回 —— 绝不哼。挂断后定时器已被清掉。
+   */
+  heartbeatTick() {
+    if (this.heartbeatOnCall !== true || this.active !== true) return false;
+    const pending = this.#pendingCount();
+    const busy = pending > 0 || this.inFlightTurn.size > 0;
+    if (!busy) return false;                                        // 空闲时绝不哼
+    const now = Date.now();
+    if (now - Math.max(this.lastActivityAt, this.lastHeartbeatAt) < this.heartbeatAfterMs) return false;
+    if (this.lastHeartbeatAt !== 0 && now - this.lastHeartbeatAt < this.heartbeatMinIntervalMs) return false;
+    const signature = `${pending}|${this.toolActionCount}|${this.lastAssistantText.length}`;
+    if (signature === this.lastHeartbeatSignature) return false;    // 同状态不重复
+    const sessionId = this.rulesSession;
+    if (typeof sessionId !== 'string' || sessionId === '') return false;
+    this.lastHeartbeatSignature = signature;
+    this.lastHeartbeatAt = now;
+    log('静默心跳:', this.heartbeatText, `pending=${pending} inFlight=${this.inFlightTurn.size}`);
+    void this.#enqueueSpeech(sessionId, this.heartbeatText);
+    return true;
   }
 
   /**
@@ -889,6 +997,8 @@ function registerRoutes(ctx, controller) {
       const { sessionId } = await body(request);
       return { chunks: controller.drainSpeech(sessionId) };
     })],
+    // 通话状态区（看得见，不念）：浮层每 2s 拉一次，纯本地内存聚合，不碰 worker
+    ['/status', ['GET', 'POST'], guard(async () => controller.status())],
     // 音色：列出（从 worker /health 推导）/ 试听 / 设为当前。三条都不重启 worker、不打断通话。
     ['/voices', ['GET', 'POST'], guard(async () => controller.voices())],
     ['/preview', ['POST'], guard(async (request) => {

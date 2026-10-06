@@ -70,11 +70,18 @@ window.__ModuleLoader__.load({
       provision: () => callApi('/provision', {}),
       // 音色：列出 / 试听 / 设为当前（三条都不重启 worker、不断通话）
       voices: () => callApi('/voices', {}),
+      // 通话状态区（看得见、不念出来）
+      status: () => callApi('/status', {}),
       preview: (args) => callApi('/preview', args),
       setVoice: (args) => callApi('/voice', args),
     };
 
     // ---------------------------------------------------------------- 端点检测
+    /** 正数解析：只认正的有限数字，其余（undefined / NaN / 0 / 负数 / 非数字串）一律回退默认值。 */
+    function positiveOr(value, fallback) {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+    }
     /**
      * 连续对话的端点检测状态机。纯函数式（只吃 RMS，不碰 Web Audio），因此可以
      * 脱离麦克风做单元测试——连续模式的手感几乎全由这里决定。
@@ -86,29 +93,36 @@ window.__ModuleLoader__.load({
      *  - 放音期抬门槛：助手正在说话时麦克风会收到扬声器回声，此时阈值乘
      *    speakingRatio，既保留「真插话」又能顶掉大多数回声。
      *
-     * @returns {{push(rms:number, speaking?:boolean):'none'|'start'|'end'|'max', reset():void, state:string, noiseFloor:number}}
+     * @returns {{push(rms:number, speaking?:boolean):'none'|'start'|'end'|'max', reset():void, state:string, noiseFloor:number, lastReason:string}}
      */
     function createEndpointDetector(options = {}) {
       const frameMs = options.frameMs ?? 64;            // 1024 采样 @16k
       const minSpeechMs = options.minSpeechMs ?? 200;   // 连续有声多久算「开始说话」
       const silenceMs = options.silenceMs ?? 3000;      // 静音多久算「说完了」（3s：句子中间的换气/想词停顿不应被当成说完）
-      // 最长一句兜底：60s（原 30s）。到点不是「丢掉尾巴」，而是**提交已录到的这一段并继续录**
-      // 下一段（检测器随即回 idle，起音预缓冲接住边界），所以超过 60s 的连续说话会分成两段
-      // 提交，而不是后半句整段消失。上限只为兜底存在，不是无限录。
-      const maxUtteranceMs = options.maxUtteranceMs ?? 60000;
+      // 最长一句兜底：120s（原 60s/30s）。到点**不硬切**——进入 pending 状态等下一次静音停顿
+      // 再提交，这样绝大多数情况断在句子之间；只有一直说不停、宽限期用尽才硬切。
+      // 内存代价：120s × 16kHz × 2B ≈ 3.84 MB，可忽略；上限只为兜底，不是无限录。
+      const maxUtteranceMs = positiveOr(options.maxUtteranceMs, 120000);
+      const maxUtteranceGraceMs = positiveOr(options.maxUtteranceGraceMs, 8000);
       const absFloor = options.absFloor ?? 0.006;       // 绝对下限，防静音室里噪声底趋近 0
       const ratio = options.ratio ?? 3.5;               // 高出噪声底多少倍算有声
       const speakingRatio = options.speakingRatio ?? 2; // 放音期阈值倍数（抗回声）
       let noise = options.noiseFloor ?? 0.004;
-      let state = 'idle';
+      let state = 'idle';            // idle | speech | pending（到点后等停顿）
       let speechMs = 0;
       let quietMs = 0;
       let totalMs = 0;
+      let pendingMs = 0;             // 进入 pending 之后又等了多久
+      let lastReason = '';           // 'silence' | 'cap-pause' | 'cap-grace'（给日志用）
+
+      const finish = () => { state = 'idle'; speechMs = 0; quietMs = 0; totalMs = 0; pendingMs = 0; };
 
       return {
         get state() { return state; },
         get noiseFloor() { return noise; },
-        reset() { state = 'idle'; speechMs = 0; quietMs = 0; totalMs = 0; },
+        /** 上一次 end/max 的成因：'silence' 正常停顿 / 'cap-pause' 到点后等到停顿 / 'cap-grace' 宽限期用尽硬切。 */
+        get lastReason() { return lastReason; },
+        reset() { finish(); lastReason = ''; },
         push(rms, speaking = false) {
           const voiced = rms > Math.max(absFloor, noise * ratio) * (speaking ? speakingRatio : 1);
           if (state === 'idle') {
@@ -129,8 +143,15 @@ window.__ModuleLoader__.load({
           totalMs += frameMs;
           if (voiced) quietMs = 0;
           else quietMs += frameMs;
-          if (totalMs >= maxUtteranceMs) { state = 'idle'; speechMs = 0; quietMs = 0; totalMs = 0; return 'max'; }
-          if (quietMs >= silenceMs) { state = 'idle'; speechMs = 0; quietMs = 0; totalMs = 0; return 'end'; }
+          if (state === 'pending') {
+            // 到点之后：等一个自然停顿就在那里提交（内容全含），一直说不停才硬切
+            pendingMs += frameMs;
+            if (quietMs >= silenceMs) { finish(); lastReason = 'cap-pause'; return 'end'; }
+            if (pendingMs >= maxUtteranceGraceMs) { finish(); lastReason = 'cap-grace'; return 'max'; }
+            return 'none';
+          }
+          if (quietMs >= silenceMs) { finish(); lastReason = 'silence'; return 'end'; }
+          if (totalMs >= maxUtteranceMs) { state = 'pending'; pendingMs = 0; return 'none'; }   // 不提交，继续录
           return 'none';
         },
       };
@@ -245,13 +266,14 @@ window.__ModuleLoader__.load({
         }
 
         if (event === 'end' || event === 'max') {
-          // 'max' 是「说太久了」的兜底：这一帧是话音不是静音，必须先收进来再提交，
-          // 否则边界丢 64ms；提交后检测器回 idle，下一段紧接着录（尾巴不丢）。
+          // 到点后的宽限硬切：这一帧是话音不是静音，必须先收进来再提交（不丢 64ms）。
           if (event === 'max') this.frames.push(frame);
           const pcm = this.#collect();
           this.preRoll = [];
+          // 成因随事件带给上层：正常停顿 / 到点后等到停顿 / 宽限期用尽硬切（日志区分用）
+          const reason = event === 'max' ? 'cap-grace' : (this.detector.lastReason || 'silence');
+          if (pcm.length > TARGET_RATE * 0.2) this.onEvent({ type: 'utterance', pcm, reason });
           this.#setState('idle');
-          if (pcm.length > TARGET_RATE * 0.2) this.onEvent({ type: 'utterance', pcm });
           return;
         }
 
@@ -417,6 +439,7 @@ window.__ModuleLoader__.load({
         this.pollTimer = null;
         this.ringTimer = null;        // 响铃上限（绝不允许无限响）
         this.tickTimer = null;        // 通话计时
+        this.activityTimer = null;    // 状态区轮询（2s，只读宿主内存）
         this.connectedAt = 0;
         this.startPromise = null;     // 首次接通只跑一次：重新展开面板不会重新 /start
         this.state = {
@@ -426,6 +449,7 @@ window.__ModuleLoader__.load({
           panelOpen: false,           // 纯 UI 标志，和通话存亡无关
           connectedAt: 0, elapsedSec: 0,
           voiceOpen: false, voice: null, voiceList: null, previewSid: null, notice: '',
+          activity: null,             // 状态区（只看不念）：pending / 工具动作 / 最近文本
         };
       }
 
@@ -532,6 +556,23 @@ window.__ModuleLoader__.load({
         }, 1000);
       }
 
+      /** 状态区：每 2s 拉一次宿主的本地聚合（不碰 worker、不产生 LLM 请求）。 */
+      #startActivityPolling() {
+        if (this.activityTimer !== null) return;
+        void this.refreshActivity();
+        this.activityTimer = setInterval(() => { void this.refreshActivity(); }, 2000);
+      }
+
+      /** 拉一次通话状态（导出为公开方法，便于单测直接驱动）。 */
+      async refreshActivity() {
+        if (this.disposed) return;
+        try {
+          const info = unwrap(await this.call.status());
+          if (this.disposed) return;
+          this.#patch({ activity: info });
+        } catch { /* 状态区失败不影响通话，下一次再试 */ }
+      }
+
       async #run() {
         try {
           if (!this.sessionId) throw new Error(this.t('noSession'));
@@ -557,6 +598,7 @@ window.__ModuleLoader__.load({
           this.connectedAt = Date.now();
           this.#patch({ phase: 'live', status: this.t('live'), connectedAt: this.connectedAt, elapsedSec: 0 });
           this.#startTicker();
+          this.#startActivityPolling();
           try { this.sounds.beep(); } catch { /* 忽略 */ }
           // 接通问候由宿主合成，播放它即证明「说」的通路正常
           if (started?.greeting) this.engine.play(b64.toPcm(started.greeting));
@@ -632,7 +674,21 @@ window.__ModuleLoader__.load({
           else if (ev.state === 'idle' && this.state.phase === 'live') this.#patch({ status: this.t('live') });
           return;
         }
-        if (ev.type === 'utterance') { this.converse(ev.pcm); return; }
+        if (ev.type === 'utterance') {
+          // 到点后靠停顿提交 / 宽限期硬切：这两条会写进宿主日志（call.log），便于排查
+          // 「话说到一半被发出去」到底是哪条路。正常停顿提交不写，免得刷日志。
+          if (ev.reason === 'cap-pause' || ev.reason === 'cap-grace') {
+            try {
+              void this.call.hello?.({
+                stage: 'utterance-submit',
+                reason: ev.reason,
+                seconds: Math.round((ev.pcm.length / TARGET_RATE) * 10) / 10,
+              });
+            } catch { /* 忽略 */ }
+          }
+          this.converse(ev.pcm);
+          return;
+        }
         if (ev.type === 'bargeIn') { void this.call.cancel(); this.engine.stopPlayback(); }
       }
 
@@ -670,6 +726,7 @@ window.__ModuleLoader__.load({
         this.#stopRinging();                  // 任何时刻挂断都立刻停铃（含还在响铃时）
         if (this.pollTimer !== null) { clearInterval(this.pollTimer); this.pollTimer = null; }
         if (this.tickTimer !== null) { clearInterval(this.tickTimer); this.tickTimer = null; }
+        if (this.activityTimer !== null) { clearInterval(this.activityTimer); this.activityTimer = null; }
         this.queue.length = 0;
         this.startPromise = null;
         try { this.sounds.close(); } catch { /* 忽略 */ }
@@ -769,6 +826,22 @@ window.__ModuleLoader__.load({
       font: 'var(--dsw-font-sm, 12px/1.5 system-ui)', color: 'var(--dsw-alias-label-primary, #111)', zIndex: 60,
     };
     const hintStyle = { marginTop: 8, color: 'var(--dsw-alias-label-secondary, #666)' };
+    const activityStyle = {
+      marginTop: 8, padding: '6px 8px', borderRadius: 'var(--dsw-radius-md, 8px)',
+      background: 'var(--dsw-alias-interactive-bg-hover, #f2f4f7)', fontSize: 11,
+    };
+
+    /** 状态区一行文案（**只看不念**）：有没有请求在飞 + 最近派了几个队友/建了几个任务。 */
+    function activityLine(activity, t) {
+      if (activity === null) return t('statusLoading');
+      const bits = [activity.busy
+        ? `${t('statusBusy')} ${activity.pending + activity.inFlightTurn}`
+        : t('statusIdle')];
+      if (activity.teammates > 0) bits.push(`${t('statusTeammates')} ${activity.teammates}`);
+      if (activity.tasks > 0) bits.push(`${t('statusTasks')} ${activity.tasks}`);
+      if (activity.messages > 0) bits.push(`${t('statusMessages')} ${activity.messages}`);
+      return bits.join(' · ');
+    }
     const voiceListStyle = {
       marginTop: 6, maxHeight: 170, overflowY: 'auto', padding: '4px 6px',
       border: '1px solid var(--dsw-alias-border-l1, #ddd)', borderRadius: 'var(--dsw-radius-md, 8px)',
@@ -959,6 +1032,12 @@ window.__ModuleLoader__.load({
           h('div', { style: { width: `${Math.min(100, Math.round((level / 0.15) * 100))}%`, height: '100%', background: 'var(--dsw-alias-brand-primary, #3b82f6)', transition: 'width .06s linear' } })),
         bindArea,
         confirmArea,
+        // 状态区：看得见、不念出来（用户要「随时知道现在什么样」，但极度反感啰嗦）
+        h('div', { style: activityStyle },
+          h('div', null, `${clock} · ${activityLine(view.state.activity, t)}`),
+          view.state.activity !== null && view.state.activity.lastText !== ''
+            && h('div', { style: { marginTop: 2, color: 'var(--dsw-alias-label-secondary, #666)' } },
+                `${t('statusLast')}: ${view.state.activity.lastText.slice(0, 60)}`)),
         // 音色区：一眼看到当前引擎/数量/当前音色，展开后逐个试听、一键设为当前。
         // 数量由宿主从 worker /health 的 speakers 推导，这里不写死。
         h('div', { style: { marginTop: 8 } },
@@ -1079,6 +1158,8 @@ window.__ModuleLoader__.load({
             voiceSet: '已设为当前音色', voiceFailed: '音色操作失败',
             voiceSingle: '当前引擎只有 1 个音色；Kokoro 的 103 个音色需要以 DSH_TTS_ENGINE=kokoro 启动 DSH',
             audioSuspended: '音频输出未就绪（已尝试恢复）；若仍听不到，请检查系统输出设备',
+            statusLoading: '读取状态…', statusIdle: '空闲', statusBusy: '进行中',
+            statusTeammates: '已派队友', statusTasks: '建了任务', statusMessages: '发了消息', statusLast: '最近',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
@@ -1099,6 +1180,8 @@ window.__ModuleLoader__.load({
             voiceSet: 'Now using voice', voiceFailed: 'Voice action failed',
             voiceSingle: 'This engine has a single voice; Kokoro\u2019s 103 voices need DSH started with DSH_TTS_ENGINE=kokoro',
             audioSuspended: 'Audio output was not ready (resume attempted); check your system output device if you still hear nothing',
+            statusLoading: 'Loading status…', statusIdle: 'Idle', statusBusy: 'Working',
+            statusTeammates: 'teammates', statusTasks: 'tasks', statusMessages: 'messages', statusLast: 'Latest',
           },
         }), 'dsh-call-mode: dictionaries');
 
