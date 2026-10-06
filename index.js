@@ -186,6 +186,50 @@ export function speakableText(markdown) {
 }
 
 /**
+ * 转写专名修正表：只修**实证过的**固定错法（task-32 从真实通话日志里抓到的），
+ * 作用于「提交给 agent 的文本」；面板上仍显示原始转写。
+ *
+ * 保守原则（很重要，改这张表前先读）：
+ *  - 左值一律是「几乎不可能是正常表达」的整词/固定短语，**绝不放单字或常见词**；
+ *  - 英文短语（get up / git hub）只在**中文上下文里**替换——英文句子里 get up 是正常说法；
+ *  - 有歧义的**故意不进默认表**：例如「已经存在过了」在正常中文里也讲得通
+ *    （「这个问题已经存在过了」），把它改成「已经说过了」会误伤真实语义。
+ *    确实需要的人可以自己加：`config.transcriptFixes: { '已经存在过了': '已经说过了' }`。
+ */
+const DEFAULT_TRANSCRIPT_FIXES = [
+  [/\bDSCH\b/g, 'DSH'],
+  [/\bdeep\s*sick\b/gi, 'DeepSeek'],
+  [/\bdeepseek\b/gi, 'DeepSeek'],
+  [/\bgith?\s*hubub\b/gi, 'GitHub'],
+  [/玉泥音/g, '御姐音'],
+  [/简验/g, '剪映'],
+  // 中文夹英文时 get up / git hub 基本就是在说 GitHub；两侧都必须挨着中文才替换
+  [/(?<=[\u4e00-\u9fff])[\s,，]*get\s*up[\s,，]*(?=[\u4e00-\u9fff])/gi, 'GitHub'],
+  [/(?<=[\u4e00-\u9fff])[\s,，]*git\s*hub[\s,，]*(?=[\u4e00-\u9fff])/gi, 'GitHub'],
+  // 识别时丢掉小数点前的 0：.7秒 → 0.7秒
+  [/(?<![\d.])\.(\d+)(?=\s*(?:秒|分钟|小时|倍|%|s\b))/gi, '0.$1'],
+];
+
+/** 把默认表与用户自定义项（`{ '错法': '正确写法' }`，按字面量匹配）合成一张表。 */
+function compileTranscriptFixes(custom) {
+  const rules = [...DEFAULT_TRANSCRIPT_FIXES];
+  if (custom !== null && typeof custom === 'object' && !Array.isArray(custom)) {
+    for (const [from, to] of Object.entries(custom)) {
+      if (typeof from !== 'string' || from === '' || typeof to !== 'string') continue;
+      rules.push([new RegExp(from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), to]);
+    }
+  }
+  return rules;
+}
+
+/** 对识别文本做保守的专名修正（导出以便单测）。 */
+export function applyTranscriptFixes(text, rules) {
+  let out = String(text ?? '');
+  for (const [re, to] of rules ?? compileTranscriptFixes(undefined)) out = out.replace(re, to);
+  return out;
+}
+
+/**
  * 先按句末标点切分，再把相邻短句合并到 maxChars 以内。
  * 合并是刻意的：每段一次 TTS 调用，短句各自合成会成倍增加往返；合并后同样
  * 能「边合成边播放」。所以段数不等于句子数——想看纯切分请把 maxChars 调小。
@@ -229,6 +273,8 @@ class CallController {
     this.replyTimeoutMs = positiveMs(config?.replyTimeoutMs ?? process.env.DSH_CALL_REPLY_TIMEOUT_MS, DEFAULT_REPLY_TIMEOUT_MS);
     // 超时等待语：默认静默（空串）。空串时 converse 会**跳过合成**，连 /tts 都不发。
     this.stillWorkingText = config?.stillWorkingText ?? process.env.DSH_CALL_STILL_WORKING_TEXT ?? DEFAULT_STILL_WORKING_TEXT;
+    // 转写专名修正：默认表保守，config.transcriptFixes（{ '错法': '正确写法' }）可追加
+    this.transcriptFixes = compileTranscriptFixes(config?.transcriptFixes);
     this.child = undefined;
     this.port = undefined;
     this.token = undefined;
@@ -507,10 +553,21 @@ class CallController {
   }
 
   /**
-   * @param {number} [speed] 省略时用构造时解析好的通话语速（this.speed）。
-   * @param {number} [sid] 省略时用当前通话选定的音色（this.ttsSid）；两者都省略则用 worker 默认。
+   * 本次合成该用哪个音色：显式选过就用它；matcha 是单说话人，固定 0 ——
+   * 否则 worker 的 DSH_TTS_SID 默认 4 会让 sherpa 每次都刷
+   * 「sid should be in the range [0, 0]. Given: 4」这条无害噪音。
+   * Kokoro 不指定（worker 用自己的默认音色）。
    */
-  async synthesize(text, speed = this.speed, sid = this.ttsSid) {
+  defaultSid() {
+    if (Number.isInteger(this.ttsSid)) return this.ttsSid;
+    return currentTtsEngine() === 'matcha' ? 0 : undefined;
+  }
+
+  /**
+   * @param {number} [speed] 省略时用构造时解析好的通话语速（this.speed）。
+   * @param {number} [sid] 省略时用 defaultSid()（当前音色 / matcha 固定 0）。
+   */
+  async synthesize(text, speed = this.speed, sid = this.defaultSid()) {
     const payload = { text, speed };
     if (Number.isInteger(sid)) payload.sid = sid;      // worker 侧校验 0..speakers-1，非法直接 400
     const res = await this.#worker('/tts', {
@@ -532,7 +589,12 @@ class CallController {
     const h = await this.health().catch(() => undefined);
     const speakers = Number.isInteger(h?.speakers) && h.speakers > 0 ? h.speakers : 0;
     const engine = typeof h?.engine === 'string' ? h.engine : 'unknown';
-    const sid = Number.isInteger(this.ttsSid) ? this.ttsSid : (Number.isInteger(h?.sid) ? h.sid : 0);
+    // 当前音色：显式选过就显示它；matcha 固定 0（它是单说话人，worker 的 DSH_TTS_SID=4 只会在
+    // 日志里刷噪音）；其它引擎用 worker 报的默认 sid。最后按 speakers 夹一下，避免显示越界值。
+    const engineNow = typeof h?.engine === 'string' ? h.engine : currentTtsEngine();
+    const fallback = engineNow === 'matcha' ? 0 : (Number.isInteger(h?.sid) ? h.sid : 0);
+    const chosen = Number.isInteger(this.ttsSid) ? this.ttsSid : fallback;
+    const sid = speakers > 0 ? Math.min(Math.max(chosen, 0), speakers - 1) : chosen;
     const value = {
       engine,
       speakers,
@@ -737,7 +799,11 @@ class CallController {
     // 【C】用户确实说了下一句 → 他关心的已经是新问题：连刚才已经取走的那批迟到回复也一并作废，
     // 否则客户端会先把过期答案念完才轮到新回答（取舍见 submitTurn 里的同名注释）。
     if (carried.length > 0) log(`用户已说下一句，作废 ${carried.length} 段已取走的迟到回复 session=${sessionId}`);
-    const { text: replyText, late } = await this.submitTurn(sessionId, transcript, timeoutMs === undefined ? {} : { timeoutMs });
+    // 专名修正：只作用于**交给 agent 的文本**；返回给客户端的 transcript 仍是原始转写，
+    // 所以面板上看到的还是识别原样（用户判断「它听清没有」用得上）。
+    const forAgent = applyTranscriptFixes(transcript, this.transcriptFixes);
+    if (forAgent !== transcript) log('转写专名修正:', transcript.slice(0, 60), '→', forAgent.slice(0, 60));
+    const { text: replyText, late } = await this.submitTurn(sessionId, forAgent, timeoutMs === undefined ? {} : { timeoutMs });
     if (late) {
       // agent 还没答完：真实结果稍后从 #enqueueSpeech 的队列取出补播。
       // 等待语默认是空串（静默）——空串走「跳过合成」，既不浪费一次 /tts，

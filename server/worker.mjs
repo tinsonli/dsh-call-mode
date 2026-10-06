@@ -171,7 +171,9 @@ const vad = new sherpa.Vad({
     threshold: 0.5,
     minSilenceDuration: 0.5,
     minSpeechDuration: 0.25,
-    maxSpeechDuration: 30,
+    // 与客户端的 maxUtteranceMs（client.js: 60000）对齐：客户端最多送来 60s 的整段，
+    // VAD 在这里再切一刀只会在段边界丢字，所以上限跟着放到 60。
+    maxSpeechDuration: 60,
     windowSize: 512,
   },
   sampleRate: SAMPLE_RATE,

@@ -92,7 +92,10 @@ window.__ModuleLoader__.load({
       const frameMs = options.frameMs ?? 64;            // 1024 采样 @16k
       const minSpeechMs = options.minSpeechMs ?? 200;   // 连续有声多久算「开始说话」
       const silenceMs = options.silenceMs ?? 3000;      // 静音多久算「说完了」（3s：句子中间的换气/想词停顿不应被当成说完）
-      const maxUtteranceMs = options.maxUtteranceMs ?? 30000;
+      // 最长一句兜底：60s（原 30s）。到点不是「丢掉尾巴」，而是**提交已录到的这一段并继续录**
+      // 下一段（检测器随即回 idle，起音预缓冲接住边界），所以超过 60s 的连续说话会分成两段
+      // 提交，而不是后半句整段消失。上限只为兜底存在，不是无限录。
+      const maxUtteranceMs = options.maxUtteranceMs ?? 60000;
       const absFloor = options.absFloor ?? 0.006;       // 绝对下限，防静音室里噪声底趋近 0
       const ratio = options.ratio ?? 3.5;               // 高出噪声底多少倍算有声
       const speakingRatio = options.speakingRatio ?? 2; // 放音期阈值倍数（抗回声）
@@ -242,6 +245,9 @@ window.__ModuleLoader__.load({
         }
 
         if (event === 'end' || event === 'max') {
+          // 'max' 是「说太久了」的兜底：这一帧是话音不是静音，必须先收进来再提交，
+          // 否则边界丢 64ms；提交后检测器回 idle，下一段紧接着录（尾巴不丢）。
+          if (event === 'max') this.frames.push(frame);
           const pcm = this.#collect();
           this.preRoll = [];
           this.#setState('idle');
@@ -1051,7 +1057,7 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       // 测试缝：脱离麦克风验证端点检测状态机、通话会话与换绑
       //（加载器只读 inject/apply，多余字段无副作用）
-      __internals: { createEndpointDetector, b64, CallSession, createCallCenter, createCallSounds },
+      __internals: { createEndpointDetector, b64, CallSession, createCallCenter, createCallSounds, CallEngine },
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, {
           zh: {
