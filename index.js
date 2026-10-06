@@ -1157,7 +1157,8 @@ function registerRoutes(ctx, controller) {
       dir: RINGTONE_DIR,
     }))],
     // 音色：列出（从 worker /health 推导）/ 试听 / 设为当前。三条都不重启 worker、不打断通话。
-    ['/voices', ['GET', 'POST'], guard(async () => controller.voices())],
+    // `{fresh:true}`：拨号面板预热完 worker 后要立刻看到真实 speakers，绕过 5s 缓存。
+    ['/voices', ['GET', 'POST'], guard(async (request) => controller.voices({ fresh: (await body(request))?.fresh === true }))],
     ['/preview', ['POST'], guard(async (request) => {
       const payload = await body(request);
       const info = await controller.voices();

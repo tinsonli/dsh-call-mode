@@ -1157,6 +1157,7 @@ window.__ModuleLoader__.load({
       let voiceOpen = false;
       let previewSid = null;
       let dialOpen = false;
+      let warm = 'idle';             // idle | warming | ready | failed —— 拨号前预热 worker 的状态
       let previewSounds = null;      // 拨号前还没有麦克风/引擎，试听走铃声这条通道
       const preview = () => {
         if (previewSounds === null) {
@@ -1184,6 +1185,7 @@ window.__ModuleLoader__.load({
         voiceList,
         voiceOpen,
         previewSid,
+        warm,
       });
       const emit = () => {
         const view = snapshot();
@@ -1240,9 +1242,9 @@ window.__ModuleLoader__.load({
           emit();
           if (voiceOpen && voiceList === null) void api.refreshVoices();
         },
-        async refreshVoices() {
+        async refreshVoices(options = {}) {
           try {
-            const info = unwrap(await call.voices());
+            const info = unwrap(await call.voices({ fresh: options.fresh === true }));
             voice = { engine: info.engine, speakers: info.speakers, sid: info.sid };
             voiceList = Array.isArray(info.voices) ? info.voices : [];
             emit();
@@ -1251,6 +1253,27 @@ window.__ModuleLoader__.load({
             notice = `${t('voiceFailed')}: ${e.message}`;
             emit();
           }
+        },
+        /**
+         * 拨号前预热 worker：走**与 /start 相同的准备路径**（/provision），
+         * 这样拨号面板能显示真实的 engine/speakers，点「拨号」也省掉那几秒拉起时间。
+         * **绝不影响拨号**：失败只把 warm 标成 failed，面板改成说人话。
+         */
+        async prewarm() {
+          if (warm === 'warming' || warm === 'ready') return warm;
+          warm = 'warming';
+          emit();
+          try {
+            const st = unwrap(await call.provision());
+            if (st?.phase === 'failed') { warm = 'failed'; emit(); return warm; }
+          } catch { /* 宿主没起来/网络问题：不阻断，继续试一次音色 */ }
+          await api.refreshVoices({ fresh: true });   // 预热后再读一次（绕过 5s 缓存）
+          const v = voice;
+          const ok = v !== null && typeof v.engine === 'string' && v.engine !== '' && v.engine !== 'unknown'
+            && Number.isInteger(v.speakers) && v.speakers > 0;
+          warm = ok ? 'ready' : 'failed';
+          emit();
+          return warm;
         },
         /** 试听：**试听优先**——先掐掉本机正在播的（通话中用引擎、拨号前用试听通道），
          *  但**不** cancel 当前回合、**不**发 /stop。播放仍走既有音频路径。 */
@@ -1315,9 +1338,13 @@ window.__ModuleLoader__.load({
           dialOpen = !dialOpen;        // 再点一下收起拨号面板
           notice = '';
           emit();
-          if (dialOpen) void api.refreshVoices();
+          if (dialOpen) {
+            void api.refreshVoices();
+            void api.prewarm();        // 打开面板就开始后台预热 worker（不 await，绝不阻断拨号）
+          }
           return null;
         },
+        /** 只有显式调用才预热（打开拨号面板会自动调；单测也直接调它）。 */
         closeDial() { if (dialOpen) { dialOpen = false; notice = ''; emit(); } },
         /** 「拨号」：从这里才真正进入呼叫流程（响铃 → 接通 → 切到通话中的简洁界面）。 */
         dial(sessionId) {
@@ -1409,6 +1436,25 @@ window.__ModuleLoader__.load({
     }
 
     // ---------------------------------------------------------------- 音量滑块 / 拨号面板
+    /**
+     * 音色行文案（拨号面板）。**绝不显示 `unknown · 0 个 · 当前 #0` 这种半成品占位**：
+     * 拨号前 worker 还没起，`/voices` 拿不到 engine/speakers 是正常状态，要说人话。
+     */
+    function voiceSummary(view, t) {
+      const v = view.voice;
+      const ready = v !== null && typeof v.engine === 'string' && v.engine !== '' && v.engine !== 'unknown'
+        && Number.isInteger(v.speakers) && v.speakers > 0;
+      if (ready) return `${v.engine} · ${v.speakers} ${t('voiceCount')} · ${t('voiceCurrent')} #${v.sid}`;
+      if (view.warm === 'failed') return t('voicePrepareFailed');
+      return t('voicePreparing');
+    }
+    /**
+     * 「拨号」主按钮的配色：**写死的对比色对**，不走任何主题变量。
+     * 理由见 DialPanel 里的注释：真机上按钮曾因主题取色变成白底白字（整块白板）。
+     * 这两个值在浅色/深色主题下都是「深蓝底 + 白字」，是主按钮的通用读法。
+     */
+    const DIAL_BUTTON_BG = '#1a6cf0';
+    const DIAL_BUTTON_FG = '#ffffff';
     /** 音量滑块（0–100%）：实时作用于播放链路与铃声/试听，并持久化。 */
     function VolumeRow({ center, t, view }) {
       const percent = Math.round((view.volume ?? 1) * 100);
@@ -1441,9 +1487,7 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', style: { ...smallBtn, flex: 'none' }, onClick: () => center.toggleVoices() },
               `${t('voiceSection')} ${view.voiceOpen ? '▾' : '▸'}`),
             h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } },
-              view.voice === null
-                ? t('voiceLoading')
-                : `${view.voice.engine} · ${view.voice.speakers} ${t('voiceCount')} · ${t('voiceCurrent')} #${view.voice.sid}`)),
+              voiceSummary(view, t))),
           view.voiceOpen && h('div', null,
             view.voice !== null && view.voice.speakers <= 1 && h('div', { style: hintStyle }, t('voiceSingle')),
             view.voiceList === null
@@ -1460,14 +1504,28 @@ window.__ModuleLoader__.load({
                       view.voice !== null && view.voice.sid === v.sid ? t('voiceCurrent') : t('voiceUse'))))))),
         h(VolumeRow, { center, t, view }),
         view.notice !== '' && h('div', { style: { marginTop: 4, fontSize: 11, color: '#b42318' } }, view.notice),
-        h('button', {
-          type: 'button', onClick: () => center.dial(view.screenSessionId),
+        /*
+         * 「拨号」主按钮：**刻意不用 <button> + 主题变量**。
+         * 真机上它渲染成了一块白板（用户截图实证）：原来是 `<button>` + `background: var(--dsw-alias-brand-primary, …)`
+         * + 写死的 `color: #fff`——一旦主题（或 UA 默认样式）把按钮底色画成浅色，就成了白底白字，
+         * 整块看起来像空白占位。修法（不动版式，只换承载方式与取色）：
+         *   ① 用 div[role=button]：不吃 UA/主题的 `button {…}` 规则；
+         *   ② 背景与文字都用**写死的对比色**，不再经过任何 var()；
+         *   ③ 文字包一层 span 并显式给色（含 WebkitTextFillColor），杜绝被继承成同色。
+         * 尺寸/内边距/圆角/字重与原来完全一致。
+         */
+        h('div', {
+          role: 'button', tabIndex: 0, 'aria-label': t('dialNow'), 'data-role': 'dial-primary',
+          onClick: () => center.dial(view.screenSessionId),
+          onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault?.(); center.dial(view.screenSessionId); } },
           style: {
-            marginTop: 10, width: '100%', padding: '12px 10px', border: 'none', cursor: 'pointer',
+            marginTop: 10, width: '100%', boxSizing: 'border-box', padding: '12px 10px',
+            border: 'none', cursor: 'pointer', textAlign: 'center', userSelect: 'none',
             borderRadius: 'var(--dsw-radius-md, 8px)', font: 'inherit', fontWeight: 600,
-            background: 'var(--dsw-alias-brand-primary, #3b82f6)', color: '#fff',
+            background: DIAL_BUTTON_BG, appearance: 'none',
           },
-        }, t('dialNow')));
+        }, h('span', { style: { color: DIAL_BUTTON_FG, WebkitTextFillColor: DIAL_BUTTON_FG, fontWeight: 600 } }, t('dialNow'))));
+
     }
 
     // ---------------------------------------------------------------- 通话浮层（root）
@@ -1634,6 +1692,7 @@ window.__ModuleLoader__.load({
             statusLoading: '读取状态…', statusIdle: '空闲', statusBusy: '进行中',
             statusTeammates: '已派队友', statusTasks: '建了任务', statusMessages: '发了消息', statusLast: '最近',
             dialTitle: '拨号', dialWith: '拨给', dialNow: '拨号', volume: '音量',
+            voicePreparing: '正在准备语音引擎…', voicePrepareFailed: '语音引擎还没起来，可以先拨号',
             ringtoneFailed: '铃声文件读取失败',
           },
           en: {
@@ -1658,6 +1717,7 @@ window.__ModuleLoader__.load({
             statusLoading: 'Loading status…', statusIdle: 'Idle', statusBusy: 'Working',
             statusTeammates: 'teammates', statusTasks: 'tasks', statusMessages: 'messages', statusLast: 'Latest',
             dialTitle: 'New call', dialWith: 'Calling', dialNow: 'Call', volume: 'Volume',
+            voicePreparing: 'Preparing the speech engine…', voicePrepareFailed: 'Speech engine is not up yet — you can still call',
             ringtoneFailed: 'Could not read the ringtone file',
           },
         }), 'dsh-call-mode: dictionaries');
