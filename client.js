@@ -269,6 +269,15 @@ window.__ModuleLoader__.load({
       /** 播放一段 PCM（int16） */
       play(pcm) {
         if (!this.ctx || pcm.length === 0) return;
+        // 长时间空闲/休眠后浏览器会把 AudioContext 挂起：不 resume 就是「有音频但听不到」。
+        // 每次播放都补一次 resume，并把上下文状态上报一次（下一次听不到时能在 call.log 里看到）。
+        if (this.ctx.state !== 'running') {
+          this.onEvent({ type: 'audio', state: this.ctx.state, sampleRate: this.ctx.sampleRate });
+          try { void this.ctx.resume(); } catch { /* 忽略 */ }
+        } else if (this.audioReported !== true) {
+          this.audioReported = true;
+          this.onEvent({ type: 'audio', state: this.ctx.state, sampleRate: this.ctx.sampleRate });
+        }
         const f32 = new Float32Array(pcm.length);
         for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
         const buffer = this.ctx.createBuffer(1, f32.length, TARGET_RATE);
@@ -596,6 +605,15 @@ window.__ModuleLoader__.load({
 
       #onEngineEvent(ev) {
         if (this.disposed) return;
+        if (ev.type === 'audio') {
+          // 一次通话只报一次：下次「听不到声音」时，call.log 里至少能看到播放时上下文的状态。
+          if (this.audioReported !== true) {
+            this.audioReported = true;
+            try { void this.call.hello?.({ stage: 'audio-play', ctxState: ev.state, rate: ev.sampleRate ?? 0 }); } catch { /* 忽略 */ }
+          }
+          if (ev.state !== 'running') this.#patch({ notice: this.t('audioSuspended') });
+          return;
+        }
         if (ev.type === 'level') {
           // 电平只求视觉平滑：抖动小于 0.004 就不发新快照。
           // 音色列表可能有上百行，不节流的话每帧都会把整张表重渲染一遍。
@@ -893,15 +911,10 @@ window.__ModuleLoader__.load({
       }, [center, t]);
       React.useEffect(() => { center.setOverlayEl(panelRef.current); return () => center.setOverlayEl(null); });
 
-      React.useEffect(() => {
-        if (view.overlayOpen !== true || view.confirmTarget !== null) return;
-        // 点浮层/按钮之外只收起 UI —— 绝不碰通话；有确认框时不收起，避免误关
-        const onDocClick = (e) => { if (!center.isInside(e.target)) center.closeOverlay(); };
-        const onEsc = (e) => { if (e.key === 'Escape') center.closeOverlay(); };
-        document.addEventListener('mousedown', onDocClick);
-        document.addEventListener('keydown', onEsc);
-        return () => { document.removeEventListener('mousedown', onDocClick); document.removeEventListener('keydown', onEsc); };
-      }, [center, view.overlayOpen, view.confirmTarget]);
+      // 常驻悬浮窗：**不做点外部自动收起**。
+      // 用户明确要求「像微信那样单独的一个小窗口」，点界面别处不许把它弄没——
+      // 之前从输入栏面板继承来的 outside-click 收起，正是「一移开就没了」的来源。
+      // 现在只有两种消失方式：显式「挂断」，或点标题栏那个「收起」。
 
       // 没有通话或用户收起时什么都不画（组件本身是 root 的，切对话不会卸载它）
       if (view.overlayOpen !== true || view.state === null) return null;
@@ -1059,6 +1072,7 @@ window.__ModuleLoader__.load({
             voiceCurrent: '当前', voiceCount: '个', voiceLoading: '读取音色…',
             voiceSet: '已设为当前音色', voiceFailed: '音色操作失败',
             voiceSingle: '当前引擎只有 1 个音色；Kokoro 的 103 个音色需要以 DSH_TTS_ENGINE=kokoro 启动 DSH',
+            audioSuspended: '音频输出未就绪（已尝试恢复）；若仍听不到，请检查系统输出设备',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
@@ -1078,6 +1092,7 @@ window.__ModuleLoader__.load({
             voiceCurrent: 'Current', voiceCount: 'voices', voiceLoading: 'Loading voices…',
             voiceSet: 'Now using voice', voiceFailed: 'Voice action failed',
             voiceSingle: 'This engine has a single voice; Kokoro\u2019s 103 voices need DSH started with DSH_TTS_ENGINE=kokoro',
+            audioSuspended: 'Audio output was not ready (resume attempted); check your system output device if you still hear nothing',
           },
         }), 'dsh-call-mode: dictionaries');
 

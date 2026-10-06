@@ -62,11 +62,19 @@ function normalizeSpeed(value, fallback) {
 }
 
 /**
- * 通话等待上限：超过它就先用一句「我还在处理，稍等一下。」接住用户，真实回复随后走
- * #enqueueSpeech 补播。30 秒在电话里是干等、体感极差，所以默认 8 秒；
+ * 通话等待上限：超过它就先返回 `late: true`，真实回复随后走 #enqueueSpeech 补播。
+ * 30 秒在电话里是干等、体感极差，所以默认 8 秒；
  * `config.replyTimeoutMs` / `DSH_CALL_REPLY_TIMEOUT_MS` 可调，单次请求的 timeoutMs 优先级最高。
  */
 const DEFAULT_REPLY_TIMEOUT_MS = 8000;
+
+/**
+ * 超时等待语：**默认空串 = 完全静默**（不合成、不播）。
+ * 用户明确嫌「我还在处理，稍等一下。」难听，所以默认不留任何固定话术；
+ * 想留一句就用 `config.stillWorkingText` 或 `DSH_CALL_STILL_WORKING_TEXT` 覆盖。
+ * 备选示例（都**不是**默认值，按需自取）：`'嗯，我看看'`、`'稍等，我确认一下'`。
+ */
+const DEFAULT_STILL_WORKING_TEXT = '';
 
 /** 毫秒解析：只认正的有限数字；其余（undefined / NaN / 0 / 负数 / 非数字串）一律回落到 fallback。 */
 function positiveMs(value, fallback) {
@@ -197,8 +205,10 @@ class CallController {
     this.explicitSpeed = normalizeSpeed(config?.speed ?? process.env.DSH_CALL_SPEED, undefined);
     this.speed = this.explicitSpeed ?? ENGINE_DEFAULT_SPEED[currentTtsEngine()];
     if (this.speed > SPEED_WARN_ABOVE) log(`语速 ${this.speed} 超过建议上限 ${SPEED_WARN_ABOVE}，音质可能明显受损`);
-    // 通话等待上限：默认 8 秒（原 30 秒）。超时先回一句「我还在处理」，真实回复随后补播。
+    // 通话等待上限：默认 8 秒（原 30 秒）。超时直接返回 late，真实回复随后补播。
     this.replyTimeoutMs = positiveMs(config?.replyTimeoutMs ?? process.env.DSH_CALL_REPLY_TIMEOUT_MS, DEFAULT_REPLY_TIMEOUT_MS);
+    // 超时等待语：默认静默（空串）。空串时 converse 会**跳过合成**，连 /tts 都不发。
+    this.stillWorkingText = config?.stillWorkingText ?? process.env.DSH_CALL_STILL_WORKING_TEXT ?? DEFAULT_STILL_WORKING_TEXT;
     this.child = undefined;
     this.port = undefined;
     this.token = undefined;
@@ -709,10 +719,15 @@ class CallController {
     if (carried.length > 0) log(`用户已说下一句，作废 ${carried.length} 段已取走的迟到回复 session=${sessionId}`);
     const { text: replyText, late } = await this.submitTurn(sessionId, transcript, timeoutMs === undefined ? {} : { timeoutMs });
     if (late) {
-      // agent 还没答完：先让用户听到一句「还在处理」，真实结果稍后从队列取出
+      // agent 还没答完：真实结果稍后从 #enqueueSpeech 的队列取出补播。
+      // 等待语默认是空串（静默）——空串走「跳过合成」，既不浪费一次 /tts，
+      // 也不会把空文本发给 worker（那会 400）。时序与 late 语义完全不变。
       const chunks = [];
-      try { chunks.push((await this.synthesize(this.config.stillWorkingText ?? '我还在处理，稍等一下。')).toString('base64')); }
-      catch (e) { log('等待语合成失败', e?.message); }
+      const stillWorking = this.stillWorkingText;
+      if (typeof stillWorking === 'string' && stillWorking.trim() !== '') {
+        try { chunks.push((await this.synthesize(stillWorking)).toString('base64')); }
+        catch (e) { log('等待语合成失败', e?.message); }
+      }
       return { transcript, replyText: '', chunks, late: true };
     }
     const spoken = speakableText(replyText);
