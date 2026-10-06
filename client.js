@@ -76,6 +76,9 @@ window.__ModuleLoader__.load({
       status: () => callApi('/status', {}),
       preview: (args) => callApi('/preview', args),
       setVoice: (args) => callApi('/voice', args),
+      /** 自备铃声文件的同源地址（宿主只伺服铃声目录里的文件，做文件名白名单）。 */
+      ringtoneUrl: (name) => `${API_BASE}/ringtone?name=${encodeURIComponent(String(name))}`,
+      ringtones: () => callApi('/ringtones', {}),
     };
 
     // ---------------------------------------------------------------- 端点检测
@@ -412,6 +415,79 @@ window.__ModuleLoader__.load({
       ringTimeoutMs: 30000, // 最多响 30s，超时收口
     };
 
+    // ---------------------------------------------------------------- 内置铃声预设
+    /** 音名 → 频率（十二平均律，A4 = 440Hz）。 */
+    const NOTE = {
+      C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23, G4: 392.00, A4: 440.00, B4: 493.88,
+      C5: 523.25, D5: 587.33, E5: 659.25, F5: 698.46, G5: 783.99, A5: 880.00, B5: 987.77,
+    };
+
+    /**
+     * 把 [音名, 拍数] 序列展开成 burst 的 [频率, 起始秒, 时长秒, 增益]；'-' 表示休止。
+     * 只写音高与节奏，不含任何录音/音频文件——全部由振荡器现场合成。
+     */
+    function melody(spec, tempo, gain = 1) {
+      const out = [];
+      let at = 0;
+      for (const [name, beats] of spec) {
+        const dur = beats * tempo;
+        if (name !== '-') out.push([NOTE[name], at, Math.max(0.07, dur - 0.03), gain]);
+        at += dur;
+      }
+      return out;
+    }
+
+    /**
+     * 内置铃声清单（**全部为公有领域旋律或本次原创**，无任何他人作品/录音；
+     * 仓库里不放任何音频文件，全部现场合成）：
+     *  - classic  经典铃声：本插件原有默认铃声（保留，别换掉用户听惯的）
+     *  - twinkle  小星星：法国童谣《Ah! vous dirai-je, maman》(1761)，公有领域
+     *  - ode      欢乐颂：贝多芬第九交响曲第四乐章主题（1824），公有领域
+     *  - frere    两只老虎：法国童谣《Frère Jacques》，公有领域
+     *  - birthday 生日快乐：Hill 姐妹《Good Morning to All》(1893)，美国法院 2016 年判定其版权无效，属公有领域
+     *  - thinking 思考小调：**本插件原创**（不含/不引用任何已知旋律），只致敬「AI 一边思考一边哼歌」这个梗
+     * ⚠️ 严禁往这里加流行歌曲或任何有版权的曲子：插件是公开分发的。
+     */
+    const RINGTONE_PRESETS = {
+      classic: { label: '经典铃声', periodMs: 2400, notes: [[660, 0, 0.32, 1], [520, 0.36, 0.4, 0.85]] },
+      twinkle: {
+        label: '小星星', periodMs: 6800,
+        notes: melody([
+          ['C4', 1], ['C4', 1], ['G4', 1], ['G4', 1], ['A4', 1], ['A4', 1], ['G4', 2],
+          ['F4', 1], ['F4', 1], ['E4', 1], ['E4', 1], ['D4', 1], ['D4', 1], ['C4', 2],
+        ], 0.4),
+      },
+      ode: {
+        label: '欢乐颂', periodMs: 6200,
+        notes: melody([
+          ['E4', 1], ['E4', 1], ['F4', 1], ['G4', 1], ['G4', 1], ['F4', 1], ['E4', 1], ['D4', 1],
+          ['C4', 1], ['C4', 1], ['D4', 1], ['E4', 1], ['E4', 1.5], ['D4', 0.5], ['D4', 2],
+        ], 0.34),
+      },
+      frere: {
+        label: '两只老虎', periodMs: 6100,
+        notes: melody([
+          ['C4', 1], ['D4', 1], ['E4', 1], ['C4', 1], ['C4', 1], ['D4', 1], ['E4', 1], ['C4', 1],
+          ['E4', 1], ['F4', 1], ['G4', 2], ['E4', 1], ['F4', 1], ['G4', 2],
+        ], 0.36),
+      },
+      birthday: {
+        label: '生日快乐', periodMs: 5900,
+        notes: melody([
+          ['G4', 0.5], ['G4', 0.5], ['A4', 1], ['G4', 1], ['C5', 1], ['B4', 2],
+          ['G4', 0.5], ['G4', 0.5], ['A4', 1], ['G4', 1], ['D5', 1], ['C5', 2],
+        ], 0.4),
+      },
+      thinking: {
+        // 原创：微微迟疑的上行 + 停顿，像在一边想一边哼。仅致敬「模型哼歌」这个梗。
+        label: '思考小调（原创）', periodMs: 6600,
+        notes: melody([
+          ['A4', 0.5], ['C5', 0.5], ['E5', 1], ['-', 0.5], ['D5', 0.5], ['C5', 0.5], ['A4', 1.5],
+          ['-', 0.5], ['G4', 0.5], ['A4', 0.5], ['C5', 1.5], ['-', 1],
+        ], 0.42, 0.8),
+      },
+    };
+
     /**
      * 来电铃声 + 接通音。用**独立的 AudioContext**：铃声必须在
      * 模型自检 / worker 拉起之前就响起来，不能等 CallEngine.open()。
@@ -427,6 +503,11 @@ window.__ModuleLoader__.load({
       let userVolume = 1;               // 音量滑块（0..1），铃声/接通音/拨号前试听共用
       // 试听播放采样率：与通话播放同源（worker 上报），缺省 16k
       let playRate = TARGET_RATE;
+      const savedRingtone = loadRingtone();
+      const wantedPreset = cfg.preset ?? savedRingtone?.preset;
+      let presetId = RINGTONE_PRESETS[wantedPreset] === undefined ? 'classic' : wantedPreset;
+      let customBuffer = null;          // 用户自备铃声（本机文件解码后），插件不内置/不分发
+      let customName = typeof savedRingtone?.file === 'string' ? savedRingtone.file : null;
       const ensure = () => {
         if (ctx === null) ctx = new AudioContext();
         if (ctx.state === 'suspended') void ctx.resume?.();
@@ -465,21 +546,102 @@ window.__ModuleLoader__.load({
         }
       };
       const ringOnce = () => {
-        try { burst([[660, 0, 0.32, 1], [520, 0.36, 0.4, 0.85]]); } catch { /* 忽略 */ }
+        try {
+          if (customBuffer !== null) { playCustomOnce(); return; }
+          burst((RINGTONE_PRESETS[presetId] ?? RINGTONE_PRESETS.classic).notes);
+        } catch { /* 忽略 */ }
       };
-      return {
+      /** 自备铃声：按文件本身长度播一次，留 0.8s 间隔再响下一遍。 */
+      const playCustomOnce = () => {
+        const audio = ensure();
+        const src = audio.createBufferSource();
+        src.buffer = customBuffer;
+        src.connect(master ?? audio.destination);
+        src.start();
+        live.push(src);
+      };
+      /** 当前铃声一轮的周期：预设用自己的长度；显式传了 ringPeriodMs 就以它为准（测试/高级配置）。 */
+      const periodMs = () => {
+        const override = Number(options.ringPeriodMs);
+        if (Number.isFinite(override) && override > 0) return override;
+        if (customBuffer !== null) {
+          const ms = (Number(customBuffer.duration) || 0) * 1000 + 800;
+          return Math.max(1500, Math.min(20000, ms));
+        }
+        return (RINGTONE_PRESETS[presetId] ?? RINGTONE_PRESETS.classic).periodMs ?? cfg.ringPeriodMs;
+      };
+      /** 响铃循环用自调度 setTimeout：周期随铃声长短变化（原来是固定 setInterval）。 */
+      const scheduleNext = () => {
+        timer = setTimeout(() => {
+          if (timer === null) return;
+          ringOnce();
+          scheduleNext();
+        }, periodMs());
+      };
+      /** 响铃中换铃声 → 立刻生效（停掉当前这轮，按新铃声重新开始）。 */
+      const restartIfRinging = () => {
+        if (timer === null) return;
+        clearTimeout(timer);
+        timer = null;
+        const nodes = live; live = [];
+        for (const node of nodes) { try { node.stop(); } catch { /* 已停 */ } }
+        api.start();
+      };
+      const api = {
         get ringing() { return timer !== null; },
         start() {
           if (cfg.enabled !== true || timer !== null) return;
           ringOnce();
-          timer = setInterval(ringOnce, cfg.ringPeriodMs);
+          scheduleNext();
         },
         /** 立刻静音（接通、挂断、超时都要立刻停）。 */
         stop() {
-          if (timer !== null) { clearInterval(timer); timer = null; }
+          if (timer !== null) { clearTimeout(timer); timer = null; }
           const nodes = live;
           live = [];
           for (const node of nodes) { try { node.stop(); } catch { /* 已停 */ } }
+        },
+        // ---- 铃声预设（语音彩蛋用；**界面不暴露任何入口**）----
+        /** 内置预设清单（id + 名称，不含音频；旋律在 RINGTONE_PRESETS）。 */
+        get presets() {
+          return Object.entries(RINGTONE_PRESETS).map(([id, p]) => ({ id, label: p.label }));
+        },
+        get preset() { return presetId; },
+        get isCustom() { return customBuffer !== null; },
+        get customName() { return customName; },
+        /** 切换内置铃声；未知 id 返回 null（调用方据此回话）。响铃中切换立刻生效，并记住到下一通。 */
+        setPreset(id) {
+          if (RINGTONE_PRESETS[id] === undefined) return null;
+          presetId = id;
+          customBuffer = null;
+          customName = null;
+          saveRingtone({ preset: id });
+          restartIfRinging();
+          return presetId;
+        },
+        /** 用户自备铃声：直接给一个已解码的 AudioBuffer（本机文件，插件不分发）。 */
+        setCustomBuffer(buffer, name) {
+          customBuffer = buffer ?? null;
+          if (typeof name === 'string' && name !== '') customName = name;
+          if (customBuffer !== null) saveRingtone({ preset: presetId, file: customName });
+          restartIfRinging();
+          return customBuffer !== null;
+        },
+        /**
+         * 从宿主路由拉一个自备铃声文件并解码（用户自己放进铃声目录的文件）。
+         * 插件只做「读本机文件 → 解码 → 当铃声」，不内置、不打包、不再分发该素材。
+         */
+        async loadCustom(url, name) {
+          const audio = ensure();
+          const res = await fetch(url);
+          if (res?.ok !== true) throw new Error(`铃声文件读取失败 HTTP ${res?.status}`);
+          const bytes = await res.arrayBuffer();
+          const buffer = await audio.decodeAudioData(bytes);
+          customBuffer = buffer;
+          if (typeof name === 'string' && name !== '') customName = name;
+          saveRingtone({ preset: presetId, file: customName });
+          restartIfRinging();
+          return Number(buffer.duration) || 0;
         },
         /** 接通音「嘟」：短促单音，表示对方接起来了。 */
         beep() {
@@ -528,6 +690,7 @@ window.__ModuleLoader__.load({
           master = null;
         },
       };
+      return api;
     }
 
     // ---------------------------------------------------------------- 通话会话
@@ -778,9 +941,17 @@ window.__ModuleLoader__.load({
         this.busy = true;
         try {
           this.#patch({ status: this.queue.length > 0 ? this.t('queued') : this.t('thinking') });
-          const res = unwrap(await this.call.converse({ sessionId: this.sessionId, pcm: b64.fromPcm(pcm), language: this.t('lang') === 'zh' ? 'zh' : 'auto' }));
+          // ringtone：把当前铃声告诉宿主 —— 语音指令「换铃声」不带名字时，宿主据此切到下一个
+          const res = unwrap(await this.call.converse({
+            sessionId: this.sessionId,
+            pcm: b64.fromPcm(pcm),
+            language: this.t('lang') === 'zh' ? 'zh' : 'auto',
+            ringtone: this.sounds.preset,
+          }));
           if (this.disposed) return;
           this.#patch({ transcript: res.transcript || '', reply: res.replyText || '', status: this.t('live') });
+          // 语音彩蛋：宿主拦下了「换铃声」这类指令，就在这里换掉铃声（界面上没有任何入口）
+          this.#applyRingtone(res);
           for (const chunk of res.chunks || []) this.engine.play(b64.toPcm(chunk));
         } catch (e) {
           if (!this.disposed) this.#patch({ status: `${this.t('error')}: ${e.message}` });
@@ -788,6 +959,29 @@ window.__ModuleLoader__.load({
           this.busy = false;
           if (!this.disposed && this.queue.length > 0) void this.#drain();
         }
+      }
+
+      /**
+       * 语音彩蛋：宿主在转写文本上识别到「换铃声」后，会在 /converse 的返回里带上
+       * `ringtone`（内置预设 id）或 `ringtoneFile`（自备铃声文件名）。这里换掉即可——
+       * 下一次响铃就是新铃声。**UI 上没有任何入口**，只能靠说。
+       */
+      #applyRingtone(res) {
+        try {
+          if (typeof res?.ringtone === 'string' && res.ringtone !== '') {
+            const id = this.sounds.setPreset?.(res.ringtone);
+            if (id !== null && id !== undefined) this.#patch({ notice: `${this.t('ringtoneChanged')} ${id}` });
+            return;
+          }
+          if (typeof res?.ringtoneFile === 'string' && res.ringtoneFile !== '') {
+            const url = this.call.ringtoneUrl?.(res.ringtoneFile);
+            if (typeof url !== 'string') return;
+            Promise.resolve(this.sounds.loadCustom?.(url, res.ringtoneFile)).then(
+              () => { if (!this.disposed) this.#patch({ notice: `${this.t('ringtoneChanged')} ${res.ringtoneFile}` }); },
+              () => { if (!this.disposed) this.#patch({ notice: this.t('ringtoneFailed') }); },
+            );
+          }
+        } catch { /* 铃声问题绝不影响通话 */ }
       }
 
       #onEngineEvent(ev) {
@@ -1001,6 +1195,14 @@ window.__ModuleLoader__.load({
         session?.dispose();
         const sessionSounds = sounds === undefined ? createCallSounds() : sounds();
         try { sessionSounds.setVolume?.(volume); } catch { /* 忽略 */ }
+        // 上一通用语音换过的自备铃声：新会话的音频上下文是新的，需要重新拉一次文件解码
+        try {
+          const custom = sessionSounds.customName;
+          if (typeof custom === 'string' && custom !== '') {
+            const url = call.ringtoneUrl?.(custom);
+            if (typeof url === 'string') void Promise.resolve(sessionSounds.loadCustom?.(url, custom)).catch(() => {});
+          }
+        } catch { /* 铃声问题不影响通话 */ }
         session = new CallSession({
           call,
           sessionId,
@@ -1183,6 +1385,26 @@ window.__ModuleLoader__.load({
 
     function saveVolume(value) {
       try { globalThis.localStorage?.setItem(VOLUME_KEY, String(value)); } catch { /* 忽略 */ }
+    }
+
+    // ---------------------------------------------------------------- 铃声记忆
+    const RINGTONE_KEY = 'dsh-call-mode.ringtone';
+
+    /**
+     * 记住上次的铃声（内置预设 id；自备铃声只记**文件名**，文件本身永不进仓库/插件）。
+     * 语音彩蛋换的铃声，下一通电话照样生效。
+     */
+    function loadRingtone() {
+      try {
+        const raw = globalThis.localStorage?.getItem(RINGTONE_KEY);
+        if (raw === null || raw === undefined || raw === '') return null;
+        const parsed = JSON.parse(raw);
+        return parsed !== null && typeof parsed === 'object' ? parsed : null;
+      } catch { return null; }
+    }
+
+    function saveRingtone(value) {
+      try { globalThis.localStorage?.setItem(RINGTONE_KEY, JSON.stringify(value ?? {})); } catch { /* 忽略 */ }
     }
 
     // ---------------------------------------------------------------- 音量滑块 / 拨号面板
@@ -1411,6 +1633,7 @@ window.__ModuleLoader__.load({
             statusLoading: '读取状态…', statusIdle: '空闲', statusBusy: '进行中',
             statusTeammates: '已派队友', statusTasks: '建了任务', statusMessages: '发了消息', statusLast: '最近',
             dialTitle: '拨号', dialWith: '拨给', dialNow: '拨号', volume: '音量',
+            ringtoneChanged: '铃声已换为', ringtoneFailed: '铃声文件读取失败',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
@@ -1434,6 +1657,7 @@ window.__ModuleLoader__.load({
             statusLoading: 'Loading status…', statusIdle: 'Idle', statusBusy: 'Working',
             statusTeammates: 'teammates', statusTasks: 'tasks', statusMessages: 'messages', statusLast: 'Latest',
             dialTitle: 'New call', dialWith: 'Calling', dialNow: 'Call', volume: 'Volume',
+            ringtoneChanged: 'Ringtone set to', ringtoneFailed: 'Could not read the ringtone file',
           },
         }), 'dsh-call-mode: dictionaries');
 

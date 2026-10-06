@@ -29,6 +29,34 @@ const MAX_PCM_BYTES = 8 * 1024 * 1024;
 const PREVIEW_MAX_CHARS = 24;
 
 /**
+ * 自备铃声目录：**用户自己**把音频文件放进来当铃声。
+ * 插件不内置、不打包、不分发这些文件——README 里写明「素材版权自负」。
+ */
+const RINGTONE_DIR = path.join(CALL_DIR, 'ringtones');
+const RINGTONE_EXTS = new Map([
+  ['.mp3', 'audio/mpeg'], ['.wav', 'audio/wav'], ['.ogg', 'audio/ogg'], ['.oga', 'audio/ogg'],
+  ['.m4a', 'audio/mp4'], ['.aac', 'audio/aac'], ['.flac', 'audio/flac'], ['.opus', 'audio/opus'],
+  ['.webm', 'audio/webm'],
+]);
+const RINGTONE_FILE_MAX = 12 * 1024 * 1024;
+
+/**
+ * 语音彩蛋：铃声指令的名字表。**id 必须与 client.js 的 RINGTONE_PRESETS 一一对应**
+ * （旋律在客户端，宿主只负责识别名字 → id）。
+ * names 里额外收了一批**语音识别常见的同音/近似写法**，宁松勿误伤。
+ */
+const RINGTONE_ALIASES = [
+  { id: 'classic', label: '经典铃声', names: ['经典', '默认', '原来的', '经典铃声', '叮铃'] },
+  { id: 'twinkle', label: '小星星', names: ['小星星', '小新星', '小兴兴', '一闪一闪', '一闪一闪亮晶晶', '星星'] },
+  { id: 'ode', label: '欢乐颂', names: ['欢乐颂', '欢乐送', '欢乐', '贝多芬', '第九交响'] },
+  { id: 'frere', label: '两只老虎', names: ['两只老虎', '二只老虎', '两只老府', '雅克兄弟', '雅克', '老虎'] },
+  { id: 'birthday', label: '生日快乐', names: ['生日快乐', '生日快了', '生日歌', '生日'] },
+  { id: 'thinking', label: '思考小调', names: ['思考', '思考曲', '思考小调', '哼歌', '哼一首', '原创', 'ai哼歌'] },
+];
+const RINGTONE_IDS = RINGTONE_ALIASES.map((entry) => entry.id);
+const RINGTONE_LABEL = new Map(RINGTONE_ALIASES.map((entry) => [entry.id, entry.label]));
+
+/**
  * 各 TTS 引擎的默认语速——**引擎→语速只有这一张表**（worker 里只保留「安全钳制」，不重复默认值）。
  *  - matcha（当前默认引擎，首块快）：1.0 偏「念稿」，1.25 接近正常说话速度；
  *  - kokoro（`DSH_TTS_ENGINE=kokoro`）：24kHz 多语言；加速就吞字，实测 1.10 起开始出错、1.25 三句全错，1.0 全对。
@@ -239,6 +267,81 @@ export function applyTranscriptFixes(text, rules) {
   return out;
 }
 
+// ---------------------------------------------------------------- 语音彩蛋：铃声指令
+/** 去掉空白与标点：语音识别给的标点不可靠，匹配前先归一。 */
+export function normalizeSpoken(text) {
+  return String(text ?? '').replace(/[\s，。！？、,.!?；;：:"'“”‘’（）()【】\[\]《》~～-]/g, '');
+}
+
+// 注意顺序：长词在前，否则「换成」会被「换」先吃掉，目标名就会多一个「成」字
+const RINGTONE_VERBS = '换成|换到|换|切换|切成|改成|改|设为|设置成|变成|调成';
+const FILLER = '[一下个把的到至为]{0,3}';
+
+/** 从「铃声换成小星星」这类句子里取出目标名（取不到就是空串 = 没指定，换下一个）。 */
+export function extractRingtoneTarget(text) {
+  const t = normalizeSpoken(text);
+  const verbs = RINGTONE_VERBS;
+  const m = t.match(new RegExp(`(?:${verbs})${FILLER}(?:来电)?铃声${FILLER}(.{0,12})`))
+    ?? t.match(new RegExp(`(?:来电)?铃声${FILLER}(?:${verbs})${FILLER}(.{0,12})`));
+  if (m === null) return '';
+  return String(m[1] ?? '').replace(/(?:吧|啊|呀|呢|嘛|哦|哈|谢谢|一下|可以吗|好吗|行吗|的)+$/g, '').trim();
+}
+
+/** 把用户说出的名字解析成内置预设或自备文件；认不出来返回 null。 */
+export function resolveRingtoneName(target, customNames = []) {
+  const q = normalizeSpoken(target);
+  if (q.length < 2) return null;
+  for (const entry of RINGTONE_ALIASES) {
+    if (entry.names.some((name) => q.includes(name) || (q.length >= 2 && name.includes(q)))) return { kind: 'set', id: entry.id };
+  }
+  for (const raw of customNames) {
+    const entry = typeof raw === 'string' ? { name: raw, file: raw } : raw;
+    const n = normalizeSpoken(entry?.name ?? '');
+    if (n !== '' && (q.includes(n) || n.includes(q))) return { kind: 'custom', file: entry.file ?? entry.name, name: entry.name };
+  }
+  return null;
+}
+
+/**
+ * 语音彩蛋的核心判定：**只认明确在说铃声的句子，宁漏不误**。
+ * 返回 null = 不是指令（照常提交给 agent）。
+ *  - {kind:'list'}                    问「有哪些铃声」——只有被问时才报
+ *  - {kind:'cycle'}                   「换铃声」没指定名字 → 换下一个
+ *  - {kind:'set', id}                 指定了内置铃声
+ *  - {kind:'custom', file, name}      指定了用户自备的铃声文件
+ *  - {kind:'unknown', asked}          名字不认识 → 回可读提示
+ * 反例（都不会命中）：铃声响了 / 这首歌的铃声很好听 / 我被铃声吵醒了 / 换个话题。
+ */
+export function matchRingtoneCommand(text, options = {}) {
+  const raw = String(text ?? '');
+  if (!raw.includes('铃声')) return null;                 // 快筛
+  const t = normalizeSpoken(raw);
+  const custom = Array.isArray(options.custom) ? options.custom : [];
+  // 1) 问清单
+  if (/铃声/.test(t) && /(?:有哪些|有什么|都有啥|都有什么|哪几种|有几种|可以选哪些|能换哪些)/.test(t)) return { kind: 'list' };
+  // 2) 切换：动词必须紧挨着「铃声」（中间只允许「把/个/一下」这类虚词），所以正常叙述不会被拦
+  const near = new RegExp(`(?:${RINGTONE_VERBS})${FILLER}(?:来电)?铃声|(?:来电)?铃声${FILLER}(?:${RINGTONE_VERBS})`);
+  if (!near.test(t)) return null;
+  const target = extractRingtoneTarget(t);
+  if (target === '') return { kind: 'cycle' };
+  return resolveRingtoneName(target, custom) ?? { kind: 'unknown', asked: target };
+}
+
+/** 自备铃声目录里的文件（插件不内置任何文件；这里只是读用户自己放进去的）。 */
+export function listCustomRingtones(dir = RINGTONE_DIR) {
+  try {
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((file) => RINGTONE_EXTS.has(path.extname(file).toLowerCase()))
+      .map((file) => ({
+        file,
+        name: path.basename(file, path.extname(file)),
+        bytes: (() => { try { return fs.statSync(path.join(dir, file)).size; } catch { return 0; } })(),
+      }))
+      .filter((entry) => entry.name !== '');
+  } catch { return []; }
+}
+
 /**
  * 先按句末标点切分，再把相邻短句合并到 maxChars 以内。
  * 合并是刻意的：每段一次 TTS 调用，短句各自合成会成倍增加往返；合并后同样
@@ -297,6 +400,8 @@ class CallController {
     this.heartbeatText = config?.heartbeatText ?? process.env.DSH_CALL_HEARTBEAT_TEXT ?? DEFAULT_HEARTBEAT_TEXT;
     this.heartbeatAfterMs = positiveMs(config?.heartbeatAfterMs ?? process.env.DSH_CALL_HEARTBEAT_AFTER_MS, DEFAULT_HEARTBEAT_AFTER_MS);
     this.heartbeatMinIntervalMs = positiveMs(config?.heartbeatMinIntervalMs, DEFAULT_HEARTBEAT_MIN_INTERVAL_MS);
+    // 语音彩蛋（铃声指令）：默认开。关掉后「换铃声」就是普通一句话，照常提交 agent。
+    this.voiceCommands = config?.voiceCommands !== false;
     this.child = undefined;
     this.port = undefined;
     this.token = undefined;
@@ -893,9 +998,10 @@ class CallController {
 
   /**
    * 一次完整往返：PCM -> 文字 -> 交给 agent -> 取回复 -> 合成语音。
-   * @returns {{transcript: string, replyText: string, chunks: string[]}}
+   * @param {string} [ringtone] 客户端当前的铃声 id（语音指令「换铃声」不带名字时据此换下一个）。
+   * @returns {{transcript: string, replyText: string, chunks: string[], ringtone?: string, ringtoneFile?: string}}
    */
-  async converse({ pcm, sessionId, language = 'auto', speed: requestedSpeed, timeoutMs }) {
+  async converse({ pcm, sessionId, language = 'auto', speed: requestedSpeed, timeoutMs, ringtone }) {
     // 显式传入的 speed 优先；客户端不传时用配置语速
     const speed = normalizeSpeed(requestedSpeed, this.speed);
     // 先把可能积压的「迟到回复」交给调用方播出（无需轮询也能送达）
@@ -911,6 +1017,11 @@ class CallController {
     // 所以面板上看到的还是识别原样（用户判断「它听清没有」用得上）。
     const forAgent = applyTranscriptFixes(transcript, this.transcriptFixes);
     if (forAgent !== transcript) log('转写专名修正:', transcript.slice(0, 60), '→', forAgent.slice(0, 60));
+    // 语音彩蛋：铃声指令在**提交给 agent 之前**拦下，完全不透传（agent 不会看到这句话）
+    if (this.voiceCommands === true) {
+      const hit = matchRingtoneCommand(forAgent, { custom: this.customRingtoneNames() });
+      if (hit !== null) return await this.#ringtoneTurn(hit, { transcript, currentRingtone: ringtone });
+    }
     const { text: replyText, late } = await this.submitTurn(sessionId, forAgent, timeoutMs === undefined ? {} : { timeoutMs });
     if (late) {
       // agent 还没答完：真实结果稍后从 #enqueueSpeech 的队列取出补播。
@@ -930,6 +1041,46 @@ class CallController {
       chunks.push((await this.synthesize(sentence, speed)).toString('base64'));
     }
     return { transcript, replyText, chunks };
+  }
+
+  /** 自备铃声目录里的文件名（缓存 10s：目录是用户手动放文件的，不必每次读盘）。 */
+  customRingtoneNames(force = false) {
+    const now = Date.now();
+    if (force !== true && this.ringtoneCache !== undefined && now - this.ringtoneCache.at < 10000) return this.ringtoneCache.value;
+    const value = listCustomRingtones().map((entry) => ({ name: entry.name, file: entry.file }));
+    this.ringtoneCache = { at: now, value };
+    return value;
+  }
+
+  /**
+   * 语音彩蛋的回应：**一句话以内**；只有「有哪些铃声」才报清单（用户对啰嗦极敏感）。
+   * 返回结构与 converse 一致，只是多带 ringtone / ringtoneFile 让客户端换铃声。
+   */
+  async #ringtoneTurn(hit, { transcript, currentRingtone }) {
+    const customs = this.customRingtoneNames();
+    const label = (id) => RINGTONE_LABEL.get(id) ?? id;
+    let replyText = '';
+    let ringtone;
+    let ringtoneFile;
+    if (hit.kind === 'list') {
+      replyText = `铃声有：${RINGTONE_IDS.map(label).join('、')}${customs.length > 0 ? `；自备的还有 ${customs.join('、')}` : ''}。`;
+    } else if (hit.kind === 'unknown') {
+      replyText = `没有「${hit.asked}」这个铃声。问「有哪些铃声」就能听清单。`;
+    } else if (hit.kind === 'custom') {
+      replyText = `好，换成 ${hit.name}。`;
+      ringtoneFile = hit.file;
+    } else {
+      // 没指定名字（「换铃声」）→ 顺着当前铃声换下一个；未知 id 时从「经典」之后开始
+      const at = Math.max(0, RINGTONE_IDS.indexOf(currentRingtone));
+      const id = hit.kind === 'set' ? hit.id : RINGTONE_IDS[(at + 1) % RINGTONE_IDS.length];
+      replyText = `好，换成${label(id)}。`;
+      ringtone = id;
+    }
+    log('语音彩蛋：铃声指令', hit.kind, hit.asked ?? hit.id ?? hit.file ?? '', '当前=', currentRingtone ?? '-', '→', replyText);
+    const chunks = [];
+    try { chunks.push((await this.synthesize(replyText)).toString('base64')); }
+    catch (e) { log('铃声确认语合成失败', e?.message); }
+    return { transcript, replyText, chunks, ringtone, ringtoneFile, late: false };
   }
 }
 
@@ -999,6 +1150,12 @@ function registerRoutes(ctx, controller) {
     })],
     // 通话状态区（看得见，不念）：浮层每 2s 拉一次，纯本地内存聚合，不碰 worker
     ['/status', ['GET', 'POST'], guard(async () => controller.status())],
+    // 铃声清单：内置预设（id+名称；旋律在客户端）+ 用户自备目录里的文件（插件不内置任何音频）
+    ['/ringtones', ['GET', 'POST'], guard(async () => ({
+      presets: RINGTONE_ALIASES.map((entry) => ({ id: entry.id, label: entry.label })),
+      custom: listCustomRingtones().map((entry) => ({ name: entry.name, file: entry.file, bytes: entry.bytes })),
+      dir: RINGTONE_DIR,
+    }))],
     // 音色：列出（从 worker /health 推导）/ 试听 / 设为当前。三条都不重启 worker、不打断通话。
     ['/voices', ['GET', 'POST'], guard(async () => controller.voices())],
     ['/preview', ['POST'], guard(async (request) => {
@@ -1027,6 +1184,30 @@ function registerRoutes(ctx, controller) {
       log('当前音色已切换 sid=', sid, 'engine=', info.engine, 'speakers=', info.speakers);
       return { sid, engine: info.engine, speakers: info.speakers };
     })],
+    /**
+     * 自备铃声文件：把**用户自己**放进铃声目录的文件原样伺服给客户端解码。
+     * 只认「目录内的单个文件名 + 允许的音频扩展名」，任何路径分隔符/`..` 一律拒绝——
+     * 这条路由绝不能变成一个任意文件读取口子。
+     */
+    ['/ringtone', ['GET'], async (request) => {
+      try {
+        const name = new URL(request.url).searchParams.get('name') ?? '';
+        const base = path.basename(name);
+        const ext = path.extname(base).toLowerCase();
+        if (base === '' || base !== name || !RINGTONE_EXTS.has(ext)) return fail('非法的铃声文件名', 400);
+        const full = path.join(RINGTONE_DIR, base);
+        if (path.dirname(path.resolve(full)) !== path.resolve(RINGTONE_DIR)) return fail('非法的铃声路径', 400);
+        const stat = await fs.promises.stat(full).catch(() => null);
+        if (stat === null || !stat.isFile() || stat.size > RINGTONE_FILE_MAX) return fail('铃声文件不存在或过大', 404);
+        const bytes = await fs.promises.readFile(full);
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'content-type': RINGTONE_EXTS.get(ext), 'content-length': String(bytes.length), 'cache-control': 'no-store' },
+        });
+      } catch (e) {
+        return fail(String(e?.message || e));
+      }
+    }],
   ];
   for (const [suffix, methods, fetch] of routes) {
     registry.register({ path: `${ROUTE_BASE}${suffix}`, methods, requestBody: 'buffered', fetch });
