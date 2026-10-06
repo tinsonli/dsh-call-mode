@@ -53,6 +53,39 @@ const TTS_ENGINE_WANTED = String(process.env.DSH_TTS_ENGINE || 'matcha').toLower
 /** Kokoro 音色编号（0–102）。默认 4：中英混读实测最清楚的一档。 */
 const TTS_SID = Number(process.env.DSH_TTS_SID || 4);
 
+/**
+ * 合成前的读音白名单（多音字/词表数据错误）。
+ *
+ * 背景（实测见 quality-lab/polyphone）：matcha 的 lexicon.txt 写的是 `重载 zhong4 zai4`，
+ * kokoro 的 lexicon-zh.txt 写的是 `ㄓ 中 4 ㄗ ㄞ 4`——同样是 zhong4 zai4，**两个引擎都念
+ * zhòng zài**，属于上游词表数据错误（正确是 chóng zài）。换引擎修不了，就地改词表又会被
+ * models.mjs 的 SHA-256 校验判为无效并重下，所以在送进合成之前按词换成同音字：
+ * 虫 chong2 + 在 zai4 = chóng zài（这两条在两个引擎的词表里都是对的）。
+ *
+ * 纪律：
+ *  - 只加**逐词实测确认会念错、且替换字在词表里读音正确**的词；没测过的一律不加；
+ *  - 只改「送进合成的文本」——屏幕显示、宿主 replyText、/tts 的响应都不经过这里；
+ *  - 按整词匹配，不做任何泛化（「载重 / 满载 / 重装 / 重要 / 重新」必须原样）；
+ *  - `DSH_TTS_PRONOUNCE=0` 可整体关闭，恢复旧行为。
+ */
+const PRONUNCIATION_FIXES = [
+  { from: '重载', to: '虫在' },
+];
+const PRONOUNCE_FIX_ON = process.env.DSH_TTS_PRONOUNCE !== '0';
+
+/** 返回「送进合成的文本」与命中记录；关闭开关时原样返回。 */
+function applyPronunciationFixes(text) {
+  if (!PRONOUNCE_FIX_ON) return { spoken: text, hits: [] };
+  let spoken = text;
+  const hits = [];
+  for (const { from, to } of PRONUNCIATION_FIXES) {
+    if (!spoken.includes(from)) continue;
+    spoken = spoken.split(from).join(to);
+    hits.push(`${from} → ${to}`);
+  }
+  return { spoken, hits };
+}
+
 const log = (...a) => process.stderr.write(`[call-worker] ${a.join(' ')}\n`);
 
 // 模型路径统一由 models.mjs 解析：插件目录优先，可回退到 DSH 自带语音缓存；
@@ -358,6 +391,8 @@ const server = createServer((req, res) => {
       engine: TTS_ENGINE,
       sid: TTS_SID,
       speakers: tts.numSpeakers,
+      // 合成前读音白名单的状态（只影响音频，不改变任何返回文本）
+      pronunciationFix: { enabled: PRONOUNCE_FIX_ON, entries: PRONUNCIATION_FIXES.map((f) => `${f.from}→${f.to}`) },
       pid: process.pid,
     });
   }
@@ -396,6 +431,9 @@ const server = createServer((req, res) => {
       catch { return json(400, { error: 'invalid json' }); }
       const text = String(body.text || '').trim();
       if (text === '') return json(400, { error: 'empty text' });
+      // 只有"送进合成"的这一份文本会被替换；text 保持原文，日志与后续逻辑都用原文。
+      const { spoken, hits } = applyPronunciationFixes(text);
+      if (hits.length) log(`TTS 读音替换: ${hits.join('、')}`);
       const requestedSpeed = Number(body.speed || 1);
       const speed = Math.min(Number.isFinite(requestedSpeed) && requestedSpeed > 0 ? requestedSpeed : 1, TTS_MAX_SPEED);
       if (speed !== requestedSpeed) log(`语速 ${requestedSpeed} -> ${speed}（Kokoro 实测安全上限，DSH_TTS_ALLOW_FAST=1 可放行）`);
@@ -432,7 +470,7 @@ const server = createServer((req, res) => {
       };
       try {
         const audio = await tts.generateAsync({
-          text,
+          text: spoken,
           generationConfig: { sid, speed },
           // Electron-as-Node 下 V8 内存笼不接受外部缓冲：不关掉它，generateAsync
           // 会走原生 reject 路径（每句都记 “TTS settlement failed”），成功日志与
