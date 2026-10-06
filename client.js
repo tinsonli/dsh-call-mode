@@ -175,6 +175,8 @@ window.__ModuleLoader__.load({
         this.nextPlayTime = 0;
         this.playing = [];
         this.captureRequested = false;
+        this.volume = 1;              // 播放音量（0..1），open() 时建 master GainNode
+        this.master = undefined;
       }
 
       async open() {
@@ -188,9 +190,22 @@ window.__ModuleLoader__.load({
         this.node.onaudioprocess = (e) => this.#onFrame(e.inputBuffer.getChannelData(0));
         this.source.connect(this.node);
         this.node.connect(this.ctx.destination);
+        // 播放链路串一个总音量（GainNode）：改滑块立刻影响正在播的音频。
+        // 默认 1.0 = 保持原来的听感（不默认变小/变大）。
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.volume;
+        this.master.connect(this.ctx.destination);
         this.detector.reset();
         this.preRoll = [];
         this.onEvent({ type: 'ready', sampleRate: this.ctx.sampleRate });
+      }
+
+      /** 设置播放音量（0..1，夹取）。实时生效：正在播的音频也会立刻变。 */
+      setVolume(value) {
+        const n = Number(value);
+        this.volume = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1;
+        if (this.master !== undefined) this.master.gain.value = this.volume;
+        return this.volume;
       }
 
       close() {
@@ -198,6 +213,7 @@ window.__ModuleLoader__.load({
         this.stream?.getTracks().forEach((t) => t.stop());
         this.ctx?.close?.();
         this.node = this.source = this.ctx = this.stream = null;
+        this.master = undefined;
         this.frames = [];
         this.onEvent({ type: 'idle' });
       }
@@ -312,7 +328,7 @@ window.__ModuleLoader__.load({
         buffer.copyToChannel(f32, 0);
         const src = this.ctx.createBufferSource();
         src.buffer = buffer;
-        src.connect(this.ctx.destination);
+        src.connect(this.master ?? this.ctx.destination);   // 走 master 总音量
         const now = this.ctx.currentTime;
         const startAt = Math.max(now, this.nextPlayTime);
         src.start(startAt);
@@ -358,10 +374,25 @@ window.__ModuleLoader__.load({
       let ctx = null;
       let timer = null;
       let live = [];
+      let playSrcs = [];
+      let master = null;
+      let userVolume = 1;               // 音量滑块（0..1），铃声/接通音/拨号前试听共用
       const ensure = () => {
         if (ctx === null) ctx = new AudioContext();
         if (ctx.state === 'suspended') void ctx.resume?.();
+        if (master === null) {
+          master = ctx.createGain();
+          master.gain.value = userVolume;
+          master.connect(ctx.destination);
+        }
         return ctx;
+      };
+      /** 音量滑块：与通话播放共用同一个值（概念少一个），0 即静音。 */
+      const setVolume = (value) => {
+        const n = Number(value);
+        userVolume = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1;
+        if (master !== null) master.gain.value = userVolume;
+        return userVolume;
       };
       /** 一串音符：[频率, 起始偏移s, 时长s, 相对音量]，用增益包络防爆音。 */
       const burst = (specs) => {
@@ -377,7 +408,7 @@ window.__ModuleLoader__.load({
           amp.gain.setValueAtTime(cfg.volume * gain, at + offset + Math.max(0.03, dur - 0.05));
           amp.gain.linearRampToValueAtTime(0, at + offset + dur);
           osc.connect(amp);
-          amp.connect(audio.destination);
+          amp.connect(master ?? audio.destination);
           osc.start(at + offset);
           osc.stop(at + offset + dur + 0.02);
           live.push(osc);
@@ -405,10 +436,39 @@ window.__ModuleLoader__.load({
           if (cfg.enabled !== true) return;
           try { burst([[880, 0, 0.15, 0.75]]); } catch { /* 忽略 */ }
         },
+        setVolume,
+        get volume() { return userVolume; },
+        /**
+         * 播放一段外部 PCM（int16）：拨号前**还没有麦克风/引擎**时也能试听音色。
+         * 走铃声自己的上下文与同一个音量节点，所以音量滑块对试听同样实时生效。
+         */
+        playPcm(int16) {
+          if (cfg.enabled !== true || int16 === undefined || int16.length === 0) return;
+          try {
+            const audio = ensure();
+            const f32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+            const buffer = audio.createBuffer(1, f32.length, TARGET_RATE);
+            buffer.copyToChannel(f32, 0);
+            const src = audio.createBufferSource();
+            src.buffer = buffer;
+            src.connect(master ?? audio.destination);
+            src.start();
+            playSrcs.push(src);
+          } catch { /* 试听失败不影响任何东西 */ }
+        },
+        /** 掐掉还没播完的试听（试听优先：点新的先停旧的）。 */
+        stopPcm() {
+          const srcs = playSrcs;
+          playSrcs = [];
+          for (const src of srcs) { try { src.stop(); } catch { /* 已停 */ } }
+        },
         close() {
           this.stop();
+          this.stopPcm();
           try { ctx?.close?.(); } catch { /* 忽略 */ }
           ctx = null;
+          master = null;
         },
       };
     }
@@ -448,7 +508,7 @@ window.__ModuleLoader__.load({
           level: 0, mode: 'ptt', transcript: '', reply: '', download: null,
           panelOpen: false,           // 纯 UI 标志，和通话存亡无关
           connectedAt: 0, elapsedSec: 0,
-          voiceOpen: false, voice: null, voiceList: null, previewSid: null, notice: '',
+          voiceOpen: false, notice: '',
           activity: null,             // 状态区（只看不念）：pending / 工具动作 / 最近文本
         };
       }
@@ -735,65 +795,7 @@ window.__ModuleLoader__.load({
         this.#patch({ phase: 'closed', panelOpen: false, level: 0 });
       }
 
-      // ----------------------------------------------------------- 音色试听/切换
-      /** 展开/收起音色区；首次展开时拉一次列表。 */
-      async toggleVoices() {
-        if (this.disposed) return;
-        const open = this.state.voiceOpen !== true;
-        this.#patch({ voiceOpen: open, notice: '' });
-        if (open && this.state.voiceList === null) await this.refreshVoices();
-      }
-
-      /** 拉可用音色列表（宿主从 worker /health 的 speakers 推导，客户端不写死数量）。 */
-      async refreshVoices() {
-        if (this.disposed) return;
-        try {
-          const info = unwrap(await this.call.voices());
-          if (this.disposed) return;
-          this.#patch({
-            voice: { engine: info.engine, speakers: info.speakers, sid: info.sid },
-            voiceList: Array.isArray(info.voices) ? info.voices : [],
-          });
-        } catch (e) {
-          if (!this.disposed) this.#patch({ voiceList: [], notice: `${this.t('voiceFailed')}: ${e.message}` });
-        }
-      }
-
-      /**
-       * 试听某个音色。
-       * 冲突策略：**试听优先——先掐掉本机正在播的语音**（engine.stopPlayback），
-       * 因为用户是在快速横比，等助手把长回复念完就没法比了。但**不** cancel 当前回合、
-       * 也**不**发 /stop：agent 的活照跑，宿主队列不动，试听完该念的还会念。
-       * 播放仍走既有的 engine.play（和正常回复同一条音频路径），不另造通路。
-       */
-      async previewVoice(sid) {
-        if (this.disposed) return;
-        this.engine.stopPlayback();
-        this.#patch({ previewSid: sid, notice: '' });
-        try {
-          const res = unwrap(await this.call.preview({ sessionId: this.sessionId, sid }));
-          if (this.disposed) return;
-          for (const chunk of res?.chunks ?? []) this.engine.play(b64.toPcm(chunk));
-          this.#patch({ previewSid: null });
-        } catch (e) {
-          if (!this.disposed) this.#patch({ previewSid: null, notice: `${this.t('voiceFailed')}: ${e.message}` });
-        }
-      }
-
-      /** 把某个音色设为当前：之后所有合成（含迟到补播、开场问候）都用它。不重启 worker。 */
-      async setVoice(sid) {
-        if (this.disposed) return;
-        try {
-          const res = unwrap(await this.call.setVoice({ sessionId: this.sessionId, sid }));
-          if (this.disposed) return;
-          this.#patch({
-            voice: { engine: res.engine, speakers: res.speakers, sid: res.sid },
-            notice: `${this.t('voiceSet')} #${res.sid}`,
-          });
-        } catch (e) {
-          if (!this.disposed) this.#patch({ notice: `${this.t('voiceFailed')}: ${e.message}` });
-        }
-      }
+      // 音色/试听的实现已挪到 createCallCenter（拨号前也要能用，通话中不再渲染那块 UI）
     }
 
     // ---------------------------------------------------------------- 通话面板
@@ -874,6 +876,21 @@ window.__ModuleLoader__.load({
       let overlayEl = null;
       let buttonEl = null;
       const t = (key) => translator(key);
+      // 音量（0..1，持久化）；音色/试听（拨号前调，通话中不渲染）；拨号面板状态
+      let volume = loadVolume();
+      let voice = null;              // { engine, speakers, sid }
+      let voiceList = null;
+      let voiceOpen = false;
+      let previewSid = null;
+      let dialOpen = false;
+      let previewSounds = null;      // 拨号前还没有麦克风/引擎，试听走铃声这条通道
+      const preview = () => {
+        if (previewSounds === null) {
+          previewSounds = sounds === undefined ? createCallSounds() : sounds();
+          try { previewSounds.setVolume?.(volume); } catch { /* 忽略 */ }
+        }
+        return previewSounds;
+      };
 
       const snapshot = () => ({
         boundSessionId: session?.sessionId ?? '',
@@ -882,11 +899,17 @@ window.__ModuleLoader__.load({
         screenLabel: screenSessionId === '' ? '' : label(screenSessionId),
         onScreen: session !== null && screenSessionId !== '' && screenSessionId === session.sessionId,
         overlayOpen,
+        dialOpen,
         inCall: session?.inCall === true,
         busy: session?.busy === true || (session?.queued ?? 0) > 0,
         state: session?.state ?? null,
         confirmTarget,
         notice,
+        volume,
+        voice,
+        voiceList,
+        voiceOpen,
+        previewSid,
       });
       const emit = () => {
         const view = snapshot();
@@ -897,13 +920,16 @@ window.__ModuleLoader__.load({
 
       const startIn = (sessionId) => {
         session?.dispose();
+        const sessionSounds = sounds === undefined ? createCallSounds() : sounds();
+        try { sessionSounds.setVolume?.(volume); } catch { /* 忽略 */ }
         session = new CallSession({
           call,
           sessionId,
           t,
-          ...sounds === undefined ? {} : { sounds: sounds() },
+          sounds: sessionSounds,
           ...ringTimeoutMs === undefined ? {} : { ringTimeoutMs },
         });
+        try { session.engine.setVolume?.(volume); } catch { /* 忽略 */ }
         session.subscribe(emit);
       };
 
@@ -914,9 +940,69 @@ window.__ModuleLoader__.load({
         setMode(mode) { session?.setMode(mode); },
         startCapture() { session?.startCapture(); },
         stopCapture() { session?.stopCapture(); },
-        toggleVoices() { void session?.toggleVoices(); },
-        previewVoice(sid) { void session?.previewVoice(sid); },
-        setVoice(sid) { void session?.setVoice(sid); },
+        // ---- 音量（C）：0..1 夹取、实时生效、持久化 ----
+        get volume() { return volume; },
+        setVolume(value) {
+          const n = Number(value);
+          volume = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1;
+          try { session?.engine?.setVolume?.(volume); } catch { /* 忽略 */ }
+          try { previewSounds?.setVolume?.(volume); } catch { /* 忽略 */ }
+          saveVolume(volume);
+          emit();
+          return volume;
+        },
+        // ---- 音色/试听（从 CallSession 挪到中心：拨号前也要能用）----
+        toggleVoices() {
+          voiceOpen = !voiceOpen;
+          notice = '';
+          emit();
+          if (voiceOpen && voiceList === null) void api.refreshVoices();
+        },
+        async refreshVoices() {
+          try {
+            const info = unwrap(await call.voices());
+            voice = { engine: info.engine, speakers: info.speakers, sid: info.sid };
+            voiceList = Array.isArray(info.voices) ? info.voices : [];
+            emit();
+          } catch (e) {
+            voiceList = [];
+            notice = `${t('voiceFailed')}: ${e.message}`;
+            emit();
+          }
+        },
+        /** 试听：**试听优先**——先掐掉本机正在播的（通话中用引擎、拨号前用试听通道），
+         *  但**不** cancel 当前回合、**不**发 /stop。播放仍走既有音频路径。 */
+        async previewVoice(sid) {
+          try { session?.engine?.stopPlayback?.(); } catch { /* 忽略 */ }
+          try { previewSounds?.stopPcm?.(); } catch { /* 忽略 */ }
+          previewSid = sid;
+          notice = '';
+          emit();
+          try {
+            const res = unwrap(await call.preview({ sessionId: session?.sessionId ?? screenSessionId, sid }));
+            const pcm = b64.toPcm(res?.chunks?.[0] ?? '');
+            if (session !== null && session.inCall === true) session.engine.play(pcm);
+            else preview().playPcm(pcm);
+            previewSid = null;
+            emit();
+          } catch (e) {
+            previewSid = null;
+            notice = `${t('voiceFailed')}: ${e.message}`;
+            emit();
+          }
+        },
+        /** 设为当前音色：宿主记住 sid，之后所有合成（含迟到补播、问候语）都用它。 */
+        async setVoice(sid) {
+          try {
+            const res = unwrap(await call.setVoice({ sessionId: session?.sessionId ?? screenSessionId, sid }));
+            voice = { engine: res.engine, speakers: res.speakers, sid: res.sid };
+            notice = `${t('voiceSet')} #${res.sid}`;
+            emit();
+          } catch (e) {
+            notice = `${t('voiceFailed')}: ${e.message}`;
+            emit();
+          }
+        },
         setTranslator(fn) { translator = fn; },
         setOverlayEl(el) { overlayEl = el; },
         setButtonEl(el) { buttonEl = el; },
@@ -932,15 +1018,31 @@ window.__ModuleLoader__.load({
           if (confirmTarget !== null && confirmTarget.sessionId !== next) confirmTarget = null;
           emit();
         },
-        /** 入口：没有通话就用按钮所在会话接通；有通话则只切换浮层显隐。 */
+        /**
+         * 入口按钮：**没有通话 → 打开拨号面板（不拨号）**；有通话 → 只切换浮层显隐。
+         * 拨号这一步单独放在 dial()，所以「点通话按钮」不会立刻响铃/接麦克风。
+         */
         toggle(sessionId) {
           if (session !== null && session.inCall) {
             overlayOpen = !overlayOpen;
+            dialOpen = false;
             emit();
             return session;
           }
           if (!sessionId) return null;
-          startIn(sessionId);
+          dialOpen = !dialOpen;        // 再点一下收起拨号面板
+          notice = '';
+          emit();
+          if (dialOpen) void api.refreshVoices();
+          return null;
+        },
+        closeDial() { if (dialOpen) { dialOpen = false; notice = ''; emit(); } },
+        /** 「拨号」：从这里才真正进入呼叫流程（响铃 → 接通 → 切到通话中的简洁界面）。 */
+        dial(sessionId) {
+          const target = sessionId !== undefined && sessionId !== '' ? sessionId : screenSessionId;
+          if (target === '') return null;
+          dialOpen = false;
+          startIn(target);
           overlayOpen = true;
           emit();
           void session.openPanel();
@@ -972,12 +1074,98 @@ window.__ModuleLoader__.load({
           confirmTarget = null;
           notice = '';
           overlayOpen = false;
+          dialOpen = false;
           session?.hangUp();
           emit();
         },
-        dispose() { session?.dispose(); session = null; listeners.clear(); },
+        dispose() {
+          session?.dispose();
+          session = null;
+          try { previewSounds?.close?.(); } catch { /* 忽略 */ }
+          previewSounds = null;
+          listeners.clear();
+        },
       };
       return api;
+    }
+
+    // ---------------------------------------------------------------- 音量持久化
+    const VOLUME_KEY = 'dsh-call-mode.volume';
+
+    /** 读取上次的音量（0..1）。localStorage 可能不可用（隐私模式/沙箱），一律容错；缺省 1.0 = 原听感。 */
+    function loadVolume() {
+      try {
+        const raw = globalThis.localStorage?.getItem(VOLUME_KEY);
+        if (raw === null || raw === undefined || raw === '') return 1;
+        const n = Number(raw);
+        return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1;
+      } catch { return 1; }
+    }
+
+    function saveVolume(value) {
+      try { globalThis.localStorage?.setItem(VOLUME_KEY, String(value)); } catch { /* 忽略 */ }
+    }
+
+    // ---------------------------------------------------------------- 音量滑块 / 拨号面板
+    /** 音量滑块（0–100%）：实时作用于播放链路与铃声/试听，并持久化。 */
+    function VolumeRow({ center, t, view }) {
+      const percent = Math.round((view.volume ?? 1) * 100);
+      return h('div', { style: { marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 } },
+        h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)', whiteSpace: 'nowrap' } },
+          `${t('volume')} ${percent}%`),
+        h('input', {
+          type: 'range', min: 0, max: 100, step: 5, value: String(percent),
+          'aria-label': t('volume'),
+          onChange: (e) => center.setVolume(Number(e.target.value) / 100),
+          style: { flex: 1, minWidth: 0 },
+        }));
+    }
+
+    /**
+     * 拨号面板：「点通话按钮」那一步的界面——音色列表 / 试听 / 音量 / 明确的「拨号」按钮。
+     * 这里**不响铃、不接麦克风**；只有点「拨号」才进入呼叫流程（多一步，换来通话中界面干净）。
+     */
+    function DialPanel({ center, t, view }) {
+      const who = view.screenLabel !== '' ? view.screenLabel : t('assistantName');
+      return h('div', { style: overlayStyle, onClick: (e) => e.stopPropagation() },
+        h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+          h('strong', null, t('dialTitle')),
+          h('button', { type: 'button', 'aria-label': t('close'), onClick: () => center.closeDial(),
+            style: { border: 'none', background: 'transparent', cursor: 'pointer', color: 'inherit', fontSize: 14 } }, '×')),
+        h('div', { style: { marginTop: 4, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } }, `${t('dialWith')} ${who}`),
+        // 音色（拨号前调）
+        h('div', { style: { marginTop: 8 } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            h('button', { type: 'button', style: { ...smallBtn, flex: 'none' }, onClick: () => center.toggleVoices() },
+              `${t('voiceSection')} ${view.voiceOpen ? '▾' : '▸'}`),
+            h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } },
+              view.voice === null
+                ? t('voiceLoading')
+                : `${view.voice.engine} · ${view.voice.speakers} ${t('voiceCount')} · ${t('voiceCurrent')} #${view.voice.sid}`)),
+          view.voiceOpen && h('div', null,
+            view.voice !== null && view.voice.speakers <= 1 && h('div', { style: hintStyle }, t('voiceSingle')),
+            view.voiceList === null
+              ? h('div', { style: hintStyle }, t('voiceLoading'))
+              : h('div', { style: voiceListStyle },
+                  ...view.voiceList.map((v) => h('div', { key: v.sid, style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0' } },
+                    h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } }, `#${v.sid} ${v.label}`),
+                    h('button', { type: 'button', style: { ...smallBtn, flex: 'none', padding: '2px 8px' },
+                      onClick: () => center.previewVoice(v.sid) },
+                      view.previewSid === v.sid ? t('voicePlaying') : t('voicePreview')),
+                    h('button', { type: 'button', style: { ...smallBtn, flex: 'none', padding: '2px 8px' },
+                      disabled: view.voice !== null && view.voice.sid === v.sid,
+                      onClick: () => center.setVoice(v.sid) },
+                      view.voice !== null && view.voice.sid === v.sid ? t('voiceCurrent') : t('voiceUse'))))))),
+        h(VolumeRow, { center, t, view }),
+        view.notice !== '' && h('div', { style: { marginTop: 4, fontSize: 11, color: '#b42318' } }, view.notice),
+        h('button', {
+          type: 'button', onClick: () => center.dial(view.screenSessionId),
+          style: {
+            marginTop: 10, width: '100%', padding: '12px 10px', border: 'none', cursor: 'pointer',
+            borderRadius: 'var(--dsw-radius-md, 8px)', font: 'inherit', fontWeight: 600,
+            background: 'var(--dsw-alias-brand-primary, #3b82f6)', color: '#fff',
+          },
+        }, t('dialNow')));
     }
 
     // ---------------------------------------------------------------- 通话浮层（root）
@@ -994,6 +1182,9 @@ window.__ModuleLoader__.load({
       // 用户明确要求「像微信那样单独的一个小窗口」，点界面别处不许把它弄没——
       // 之前从输入栏面板继承来的 outside-click 收起，正是「一移开就没了」的来源。
       // 现在只有两种消失方式：显式「挂断」，或点标题栏那个「收起」。
+
+      // 拨号面板：点通话按钮先到这里（改音色/音量），点「拨号」才真的响铃
+      if (view.dialOpen === true && view.inCall !== true) return h(DialPanel, { center, t, view });
 
       // 没有通话或用户收起时什么都不画（组件本身是 root 的，切对话不会卸载它）
       if (view.overlayOpen !== true || view.state === null) return null;
@@ -1038,31 +1229,11 @@ window.__ModuleLoader__.load({
           view.state.activity !== null && view.state.activity.lastText !== ''
             && h('div', { style: { marginTop: 2, color: 'var(--dsw-alias-label-secondary, #666)' } },
                 `${t('statusLast')}: ${view.state.activity.lastText.slice(0, 60)}`)),
-        // 音色区：一眼看到当前引擎/数量/当前音色，展开后逐个试听、一键设为当前。
-        // 数量由宿主从 worker /health 的 speakers 推导，这里不写死。
-        h('div', { style: { marginTop: 8 } },
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-            h('button', { type: 'button', style: { ...smallBtn, flex: 'none' },
-              onClick: () => center.toggleVoices() }, `${t('voiceSection')} ${view.state.voiceOpen ? '▾' : '▸'}`),
-            h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } },
-              view.state.voice === null
-                ? t('voiceLoading')
-                : `${view.state.voice.engine} · ${view.state.voice.speakers} ${t('voiceCount')} · ${t('voiceCurrent')} #${view.state.voice.sid}`)),
-          view.state.voiceOpen && h('div', null,
-            view.state.voice !== null && view.state.voice.speakers <= 1 && h('div', { style: hintStyle }, t('voiceSingle')),
-            view.state.voiceList === null
-              ? h('div', { style: hintStyle }, t('voiceLoading'))
-              : h('div', { style: voiceListStyle },
-                  ...view.state.voiceList.map((v) => h('div', { key: v.sid, style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0' } },
-                    h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #666)' } }, `#${v.sid} ${v.label}`),
-                    h('button', { type: 'button', style: { ...smallBtn, flex: 'none', padding: '2px 8px' },
-                      onClick: () => center.previewVoice(v.sid) },
-                      view.state.previewSid === v.sid ? t('voicePlaying') : t('voicePreview')),
-                    h('button', { type: 'button', style: { ...smallBtn, flex: 'none', padding: '2px 8px' },
-                      disabled: view.state.voice !== null && view.state.voice.sid === v.sid,
-                      onClick: () => center.setVoice(v.sid) },
-                      view.state.voice !== null && view.state.voice.sid === v.sid ? t('voiceCurrent') : t('voiceUse')))))),
-          view.state.notice !== '' && h('div', { style: { marginTop: 4, fontSize: 11, color: '#b42318' } }, view.state.notice)),
+        // 音量：通话中唯一新增的控件（用户提到会和别的声音听串）
+        h(VolumeRow, { center, t, view }),
+        view.state.notice !== '' && h('div', { style: { marginTop: 4, fontSize: 11, color: '#b42318' } }, view.state.notice),
+        // 音色/试听**不在通话中渲染**：用户要求通话界面像微信一样干净，
+        // 音色挪到「点通话按钮」那一步的拨号面板里（见 DialPanel）。
         mode === 'ptt'
           ? h('button', {
               type: 'button', disabled: phase !== 'live',
@@ -1092,7 +1263,7 @@ window.__ModuleLoader__.load({
 
       // 注意：这里**没有**卸载回收。按钮是 session 作用域的，切对话就会卸载，
       // 通话的回收只归 center（插件级 effect）与显式挂断，见 apply()。
-      const open = view.overlayOpen;
+      const open = view.overlayOpen || view.dialOpen;
       const inCall = view.inCall;
       const elsewhere = inCall && view.screenSessionId !== '' && view.boundSessionId !== view.screenSessionId;
 
@@ -1160,6 +1331,7 @@ window.__ModuleLoader__.load({
             audioSuspended: '音频输出未就绪（已尝试恢复）；若仍听不到，请检查系统输出设备',
             statusLoading: '读取状态…', statusIdle: '空闲', statusBusy: '进行中',
             statusTeammates: '已派队友', statusTasks: '建了任务', statusMessages: '发了消息', statusLast: '最近',
+            dialTitle: '拨号', dialWith: '拨给', dialNow: '拨号', volume: '音量',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
@@ -1182,6 +1354,7 @@ window.__ModuleLoader__.load({
             audioSuspended: 'Audio output was not ready (resume attempted); check your system output device if you still hear nothing',
             statusLoading: 'Loading status…', statusIdle: 'Idle', statusBusy: 'Working',
             statusTeammates: 'teammates', statusTasks: 'tasks', statusMessages: 'messages', statusLast: 'Latest',
+            dialTitle: 'New call', dialWith: 'Calling', dialNow: 'Call', volume: 'Volume',
           },
         }), 'dsh-call-mode: dictionaries');
 

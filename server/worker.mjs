@@ -204,9 +204,11 @@ const vad = new sherpa.Vad({
     threshold: 0.5,
     minSilenceDuration: 0.5,
     minSpeechDuration: 0.25,
-    // 与客户端的 maxUtteranceMs（client.js: 60000）对齐：客户端最多送来 60s 的整段，
-    // VAD 在这里再切一刀只会在段边界丢字，所以上限跟着放到 60。
-    maxSpeechDuration: 60,
+    // ⚠️ 必须与客户端的上限一致：`client.js` 的 `maxUtteranceMs` = 120000（120s）。
+    // 这里若比它小，60–120s 的整段录音会被 VAD 内部再切一刀分别识别、文本拼接——
+    // 音频不丢，但那一刀可能落在词中间，转写边界就会有瑕疵。
+    // 改动的任何一边都要同步改另一边。
+    maxSpeechDuration: 120,
     windowSize: 512,
   },
   sampleRate: SAMPLE_RATE,
