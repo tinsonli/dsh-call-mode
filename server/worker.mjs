@@ -49,7 +49,9 @@ const SAMPLE_RATE = 16000;
  * 或 `kokoro`（可选，Kokoro 多语言 v1.1，24kHz、103 音色，音色更好但首块约 1s）。
  * 无论选哪个，对客户端都输出 16kHz int16 —— 采样率差异在 worker 内消化。
  */
-const TTS_ENGINE_WANTED = String(process.env.DSH_TTS_ENGINE || 'matcha').toLowerCase() === 'kokoro' ? 'kokoro' : 'matcha';
+const TTS_ENGINE_WANTED = ['kokoro', 'melo'].includes(String(process.env.DSH_TTS_ENGINE || 'matcha').toLowerCase())
+  ? String(process.env.DSH_TTS_ENGINE).toLowerCase()
+  : 'matcha';
 /** Kokoro 音色编号（0–102）。默认 4：中英混读实测最清楚的一档。 */
 const TTS_SID = Number(process.env.DSH_TTS_SID || 4);
 
@@ -97,12 +99,16 @@ const vadModel = process.env.DSH_STT_VAD || resolved.vad;
 const ttsDir = process.env.DSH_TTS_DIR || resolved.ttsDir;
 const vocoder = process.env.DSH_TTS_VOCODER || resolved.vocoder;
 const kokoroDir = process.env.DSH_TTS_KOKORO_DIR || resolved.kokoroDir;
+const meloDir = process.env.DSH_TTS_MELO_DIR || resolved.meloDir;
 
 /** 某引擎的关键模型文件是否都在磁盘上。 */
 function engineModelsPresent(engine) {
   const need = engine === 'kokoro'
     ? [path.join(kokoroDir, 'model.onnx'), path.join(kokoroDir, 'voices.bin'), path.join(kokoroDir, 'tokens.txt'), path.join(kokoroDir, 'espeak-ng-data', 'phontab')]
-    : [process.env.DSH_TTS_MODEL || path.join(ttsDir, 'model-steps-3.onnx'), vocoder, path.join(ttsDir, 'tokens.txt'), path.join(ttsDir, 'espeak-ng-data', 'phontab')];
+    : engine === 'melo'
+      // MeloTTS 不需要 espeak-ng-data（给了反而会绕开它自带的词表）
+      ? [path.join(meloDir, 'model.onnx'), path.join(meloDir, 'lexicon.txt'), path.join(meloDir, 'tokens.txt'), path.join(meloDir, 'dict', 'jieba.dict.utf8')]
+      : [process.env.DSH_TTS_MODEL || path.join(ttsDir, 'model-steps-3.onnx'), vocoder, path.join(ttsDir, 'tokens.txt'), path.join(ttsDir, 'espeak-ng-data', 'phontab')];
   return need.every((f) => fs.existsSync(f));
 }
 
@@ -114,10 +120,11 @@ function engineModelsPresent(engine) {
  */
 let TTS_ENGINE = TTS_ENGINE_WANTED;
 if (!engineModelsPresent(TTS_ENGINE)) {
-  const other = TTS_ENGINE === 'kokoro' ? 'matcha' : 'kokoro';
-  if (engineModelsPresent(other)) {
-    log(`TTS 引擎 ${TTS_ENGINE} 的模型不齐，回退到 ${other}（重启 DSH 后宿主与 worker 的默认值才会一致）`);
-    TTS_ENGINE = other;
+  const others = ['matcha', 'kokoro', 'melo'].filter((e) => e !== TTS_ENGINE);
+  const fallback = others.find((e) => engineModelsPresent(e));
+  if (fallback) {
+    log(`TTS 引擎 ${TTS_ENGINE} 的模型不齐，回退到 ${fallback}（重启 DSH 后宿主与 worker 的默认值才会一致）`);
+    TTS_ENGINE = fallback;
   }
 }
 
@@ -141,9 +148,35 @@ const sttConfig = {
 };
 
 // ---------------------------------------------------------------- 语音合成
-// 两个引擎共用同一个 /tts 出口（16kHz int16 PCM），切换只影响模型与音色。
+// 三个引擎共用同一个 /tts 出口；输出采样率默认压到 16kHz，开 DSH_TTS_NATIVE_RATE=1
+// 时按模型原生采样率输出（客户端会按 x-sample-rate 建缓冲，两侧必须配对）。
 function buildTtsConfig() {
   const common = { numThreads: THREADS, provider: 'cpu', debug: 0 };
+  if (TTS_ENGINE === 'melo') {
+    const dir = meloDir;
+    return {
+      model: {
+        vits: {
+          model: process.env.DSH_TTS_MODEL || path.join(dir, 'model.onnx'),
+          lexicon: path.join(dir, 'lexicon.txt'),
+          tokens: path.join(dir, 'tokens.txt'),
+          // ⚠️ 故意**不传 dataDir**：MeloTTS 不需要 espeak-ng-data，而一旦传了非空
+          // dataDir，前端会改走 espeak 音素化、绕开它自带的 6.6 万条中文词表，
+          // 中文立刻变乱码（task-24 实测 C3/C4）。保持为空才对。
+        },
+        ...common,
+      },
+      // 数字/日期/电话规整：不开会把 "8"、"30"、"0.2" 当 OOV 丢掉（实测召回 47%）
+      ruleFsts: [
+        path.join(dir, 'phone.fst'),
+        path.join(dir, 'date.fst'),
+        path.join(dir, 'number.fst'),
+        path.join(dir, 'new_heteronym.fst'),
+      ].join(','),
+      maxNumSentences: 1,
+      silenceScale: 0.2,
+    };
+  }
   if (TTS_ENGINE === 'kokoro') {
     const dir = kokoroDir;
     return {
@@ -189,7 +222,7 @@ function buildTtsConfig() {
       silenceScale: 0.2,
     };
   }
-  throw new Error(`未知的 TTS 引擎 DSH_TTS_ENGINE=${TTS_ENGINE}（可用：kokoro / matcha）`);
+  throw new Error(`未知的 TTS 引擎 DSH_TTS_ENGINE=${TTS_ENGINE}（可用：matcha / kokoro / melo）`);
 }
 
 const t0 = Date.now();
@@ -215,12 +248,17 @@ const vad = new sherpa.Vad({
   numThreads: THREADS,
   provider: 'cpu',
   debug: 0,
-}, 32);
+}, 120);   // 环形缓冲 120s：与上面的 maxSpeechDuration/客户端上限一致，避免长音频自动扩容刷 Overflow 日志
 
 const sttSampleRate = SAMPLE_RATE;
-// 模型采样率可能与链路不同（Kokoro 24kHz / Matcha 16kHz）。这里不再直接失败，
-// 而是把差异在 worker 内消化：客户端播放、STT、/tts 的 PCM 全部保持 16kHz 假设。
+/**
+ * 模型原生采样率可能与链路不同（Melo 44.1k / Kokoro 24k / Matcha 16k）。
+ * `DSH_TTS_NATIVE_RATE=1` 时按模型原生采样率输出，客户端会照 `x-sample-rate` 建播放缓冲；
+ * 默认关（输出压回 16kHz），保证与旧客户端的配对关系不变。
+ */
+const NATIVE_RATE = process.env.DSH_TTS_NATIVE_RATE === '1';
 const ttsModelRate = tts.sampleRate;
+const OUTPUT_RATE = NATIVE_RATE ? tts.sampleRate : SAMPLE_RATE;
 
 // ---------------------------------------------------------------- 工具
 function int16ToFloat(buf) {
@@ -324,7 +362,7 @@ function createResampler(inRate, outRate) {
   };
 }
 
-function wavHeader(dataBytes) {
+function wavHeader(dataBytes, rate = SAMPLE_RATE) {
   const h = Buffer.alloc(44);
   h.write('RIFF', 0);
   h.writeUInt32LE(36 + dataBytes, 4);
@@ -333,8 +371,8 @@ function wavHeader(dataBytes) {
   h.writeUInt32LE(16, 16);
   h.writeUInt16LE(1, 20);
   h.writeUInt16LE(1, 22);
-  h.writeUInt32LE(SAMPLE_RATE, 24);
-  h.writeUInt32LE(SAMPLE_RATE * 2, 28);
+  h.writeUInt32LE(rate, 24);
+  h.writeUInt32LE(rate * 2, 28);
   h.writeUInt16LE(2, 32);
   h.writeUInt16LE(16, 34);
   h.write('data', 36);
@@ -388,8 +426,9 @@ const server = createServer((req, res) => {
     return json(200, {
       ok: true,
       sttSampleRate,
-      ttsSampleRate: SAMPLE_RATE,        // 对客户端输出恒为 16k
-      ttsModelSampleRate: ttsModelRate,  // 模型原生采样率（Kokoro 24k / Matcha 16k）
+      ttsSampleRate: OUTPUT_RATE,        // 实际送给客户端的采样率（原生档 = 模型采样率）
+      ttsModelSampleRate: ttsModelRate,  // 模型原生采样率（Melo 44.1k / Kokoro 24k / Matcha 16k）
+      nativeRate: NATIVE_RATE,           // 是否开启了原生采样率输出
       engine: TTS_ENGINE,
       sid: TTS_SID,
       speakers: tts.numSpeakers,
@@ -457,15 +496,15 @@ const server = createServer((req, res) => {
       const pieces = [];
 
       if (asWav) res.writeHead(200, { 'content-type': 'audio/wav' });
-      else res.writeHead(200, { 'content-type': 'audio/pcm', 'x-sample-rate': String(SAMPLE_RATE), 'x-channels': '1', 'x-format': 's16le' });
+      else res.writeHead(200, { 'content-type': 'audio/pcm', 'x-sample-rate': String(OUTPUT_RATE), 'x-channels': '1', 'x-format': 's16le' });
 
       const writable = () => !res.writableEnded && !res.destroyed;
-      // 每个请求一份重采样状态（跨 chunk 连续），保证输出恒为 16kHz
-      const resampler = createResampler(tts.sampleRate, SAMPLE_RATE);
-      const emit = (samples16k) => {
-        if (samples16k.length === 0) return;
+      // 每个请求一份重采样状态（跨 chunk 连续）。原生档下 inRate === outRate，直通零开销。
+      const resampler = createResampler(ttsModelRate, OUTPUT_RATE);
+      const emit = (samplesOut) => {
+        if (samplesOut.length === 0) return;
         if (firstChunkMs === null) firstChunkMs = Date.now() - started;
-        const pcm = floatToInt16(samples16k);
+        const pcm = floatToInt16(samplesOut);
         sent += pcm.length;
         if (asWav) pieces.push(pcm);
         else res.write(pcm);
@@ -490,11 +529,11 @@ const server = createServer((req, res) => {
         if (generation !== ttsGeneration) log(`TTS 被取消: ${text.slice(0, 20)}`);
         if (asWav) {
           const data = Buffer.concat(pieces);
-          res.end(Buffer.concat([wavHeader(data.length), data]));
+          res.end(Buffer.concat([wavHeader(data.length, OUTPUT_RATE), data]));
         } else {
           res.end();
         }
-        log(`TTS "${text.slice(0, 24)}" sid=${sid} speed=${speed} 首块=${firstChunkMs}ms 总=${Date.now() - started}ms 音频=${(sent / 2 / SAMPLE_RATE).toFixed(2)}s ${ttsModelRate === SAMPLE_RATE ? '' : `${ttsModelRate}Hz→${SAMPLE_RATE}Hz `}完成=${audio.samples.length / audio.sampleRate > 0}`);
+        log(`TTS "${text.slice(0, 24)}" sid=${sid} speed=${speed} 首块=${firstChunkMs}ms 总=${Date.now() - started}ms 音频=${(sent / 2 / OUTPUT_RATE).toFixed(2)}s ${ttsModelRate === OUTPUT_RATE ? `原生${OUTPUT_RATE}Hz` : `${ttsModelRate}Hz→${OUTPUT_RATE}Hz`} 完成=${audio.samples.length / audio.sampleRate > 0}`);
       } catch (e) {
         log('TTS 失败', e.message);
         if (writable()) res.end();

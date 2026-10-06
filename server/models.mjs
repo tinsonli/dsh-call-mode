@@ -38,16 +38,32 @@ export const KOKORO_TOKENS = { name: 'tokens.txt', bytes: 1111, sha256: '931ab2d
 export const KOKORO_LEXICON_US = { name: 'lexicon-us-en.txt', bytes: 5956885, sha256: '7daaab53a181be9885b853a8582bf1838186317e5dadacbcef9c426d6fa0da14' };
 export const KOKORO_LEXICON_ZH = { name: 'lexicon-zh.txt', bytes: 2119465, sha256: '11111d8cd695fba2ace1367a1d0a708b586e6ef5c1f9be91da5d7eef129b651c' };
 
+/** TTS 高采样率引擎（MeloTTS zh-en，44.1kHz，中英混读，上游 MyShell MeloTTS 为 MIT）。 */
+export const MELO_ARCHIVE = {
+  file: 'vits-melo-tts-zh_en.tar.bz2',
+  url: `${GH}/tts-models/vits-melo-tts-zh_en.tar.bz2`,
+  bytes: 167006755,
+  sha256: 'e58351ed7149f290a54534538badd4077cdbe6fddc964b24d0bee870415d1514',
+  innerDir: 'vits-melo-tts-zh_en',
+};
+export const MELO_MODEL = { name: 'model.onnx', bytes: 170429550, sha256: 'bf30582eb1b012250a35b1a4a80e7dfbcf8485e7bb9de0d95efbbeef0e4ad86d' };
+export const MELO_LEXICON = { name: 'lexicon.txt', bytes: 6837671, sha256: '7236884b02435ac5d10cf69b4be40a61b45aa676b5300f0e412f185748fee528' };
+export const MELO_TOKENS = { name: 'tokens.txt', bytes: 655, sha256: 'd18664a7e12bd7ea1022ddaf951e534e136815016c5a809d6b64156bffb4369d' };
+
 /** TTS 回退引擎（MatchaTTS zh-en，16kHz，音色单薄但首块延迟极低）。 */
 export const TTS_ACOUSTIC = { name: 'model-steps-3.onnx', bytes: 75717082, sha256: '524286bf6cf11be74329ae1c682ac69e34d6860c2ea9fd1290319d561540b16a' };
 export const TTS_VOCODER = { name: 'vocos-16khz-univ.onnx', bytes: 53882848, sha256: 'b599142a1fb8ff03de3e84ac35ff537c619e56f4267a6fe894851a42844acf9e' };
 
 /**
- * 当前 TTS 引擎：`matcha`（默认，旧方案，首块延迟几十毫秒）| `kokoro`（可选，音色更好）。
+ * 当前 TTS 引擎：
+ *  - `matcha`（默认，16kHz，首块延迟几十毫秒）
+ *  - `kokoro`（可选，24kHz，103 个音色）
+ *  - `melo`  （可选，**44.1kHz** 原生输出，MeloTTS zh-en，单女声）
  * 宿主（index.js）与子进程（worker.mjs）读同一个环境变量，模型准备与推理必须一致。
  */
 export function ttsEngine() {
-  return String(process.env.DSH_TTS_ENGINE || 'matcha').toLowerCase() === 'kokoro' ? 'kokoro' : 'matcha';
+  const e = String(process.env.DSH_TTS_ENGINE || 'matcha').toLowerCase();
+  return e === 'kokoro' || e === 'melo' ? e : 'matcha';
 }
 
 const STT_TAR = {
@@ -71,6 +87,7 @@ for (const [label, sha] of [
   ['TTS_ACOUSTIC', TTS_ACOUSTIC.sha256], ['TTS_VOCODER', TTS_VOCODER.sha256], ['TTS_TAR', TTS_TAR.sha256],
   ['KOKORO_ARCHIVE', KOKORO_ARCHIVE.sha256], ['KOKORO_MODEL', KOKORO_MODEL.sha256], ['KOKORO_VOICES', KOKORO_VOICES.sha256],
   ['KOKORO_TOKENS', KOKORO_TOKENS.sha256], ['KOKORO_LEXICON_US', KOKORO_LEXICON_US.sha256], ['KOKORO_LEXICON_ZH', KOKORO_LEXICON_ZH.sha256],
+  ['MELO_ARCHIVE', MELO_ARCHIVE.sha256], ['MELO_MODEL', MELO_MODEL.sha256], ['MELO_LEXICON', MELO_LEXICON.sha256], ['MELO_TOKENS', MELO_TOKENS.sha256],
 ]) {
   if (!/^[0-9a-f]{64}$/.test(sha)) throw new Error(`models.mjs: ${label}.sha256 必须是 64 位小写十六进制，实际长度 ${sha?.length}`);
 }
@@ -78,6 +95,7 @@ for (const [label, sha] of [
 /** 各文件在插件模型目录里的落点。 */
 export function targetPaths(root) {
   const k = path.join(root, KOKORO_ARCHIVE.innerDir);
+  const m = path.join(root, MELO_ARCHIVE.innerDir);
   return {
     sttModel: path.join(root, 'sensevoice', STT_MODEL.name),
     sttTokens: path.join(root, 'sensevoice', STT_TOKENS.name),
@@ -91,6 +109,10 @@ export function targetPaths(root) {
     kokoroTokens: path.join(k, KOKORO_TOKENS.name),
     kokoroLexiconUs: path.join(k, KOKORO_LEXICON_US.name),
     kokoroLexiconZh: path.join(k, KOKORO_LEXICON_ZH.name),
+    meloDir: m,
+    meloModel: path.join(m, MELO_MODEL.name),
+    meloLexicon: path.join(m, MELO_LEXICON.name),
+    meloTokens: path.join(m, MELO_TOKENS.name),
   };
 }
 
@@ -103,6 +125,20 @@ async function kokoroReady(t) {
     isValid(t.kokoroLexiconUs, KOKORO_LEXICON_US),
     isValid(t.kokoroLexiconZh, KOKORO_LEXICON_ZH),
     isValid(path.join(t.kokoroDir, 'espeak-ng-data', 'phontab'), {}),
+  ])).every(Boolean);
+}
+
+/**
+ * MeloTTS 就绪判定：模型 + 中文词表 + tokens + jieba 词典。
+ * ⚠️ 它**不需要 espeak-ng-data**：实测只要给 vits 传了非空 dataDir，前端就会改走
+ * espeak 音素化、绕过它自带的中文词表，中文立刻变乱码（task-24 实测 C3/C4）。
+ */
+async function meloReady(t) {
+  return (await Promise.all([
+    isValid(t.meloModel, MELO_MODEL),
+    isValid(t.meloLexicon, MELO_LEXICON),
+    isValid(t.meloTokens, MELO_TOKENS),
+    isValid(path.join(t.meloDir, 'dict', 'jieba.dict.utf8'), {}),
   ])).every(Boolean);
 }
 
@@ -129,6 +165,10 @@ export function resolvePaths(root) {
     kokoroTokens: t.kokoroTokens,
     kokoroLexiconUs: t.kokoroLexiconUs,
     kokoroLexiconZh: t.kokoroLexiconZh,
+    meloDir: t.meloDir,
+    meloModel: t.meloModel,
+    meloLexicon: t.meloLexicon,
+    meloTokens: t.meloTokens,
   };
 }
 
@@ -282,10 +322,27 @@ export async function ensureModels({ root, log = () => {}, onProgress = () => {}
   }
   nextStep();
 
-  // 3) 合成模型：默认 MatchaTTS（首块快）；DSH_TTS_ENGINE=kokoro 时才准备 Kokoro。
-  //    两者互斥：没选中的那个引擎即使一个文件都没有，也不影响就绪判定。
+  // 3) 合成模型：默认 MatchaTTS（首块快）；DSH_TTS_ENGINE=kokoro / melo 时才准备对应模型。
+  //    三者互斥：没选中的引擎即使一个文件都没有，也不影响就绪判定。
   const engine = ttsEngine();
-  if (engine === 'kokoro') {
+  if (engine === 'melo') {
+    if (await meloReady(t)) { log('合成模型已存在（Melo 44.1k），跳过下载'); reused += 1; }
+    else {
+      const archive = path.join(tmp, MELO_ARCHIVE.file);
+      const ok = await download({ ...MELO_ARCHIVE, file: archive, label: '合成模型(Melo 44.1k)', log, onProgress: (p) => report('合成模型(Melo 44.1k)', p.percent, p.detail) });
+      if (!ok) missing.push('合成模型(Melo)');
+      else {
+        await extractTar(archive, root, log);
+        fs.rmSync(archive, { force: true });
+        if (await meloReady(t)) downloaded += 1;
+        else missing.push('合成模型(Melo)校验');
+      }
+    }
+    nextStep();
+    // 4) MeloTTS 自带词表与 jieba 词典，同包解出；它不需要声码器与 espeak 数据
+    log('Melo 44.1k：词表/词典随包解出，无需声码器与 espeak-ng-data');
+    nextStep();
+  } else if (engine === 'kokoro') {
     if (await kokoroReady(t)) { log('合成模型已存在（Kokoro），跳过下载'); reused += 1; }
     else {
       const archive = path.join(tmp, KOKORO_ARCHIVE.file);
@@ -359,10 +416,16 @@ export async function checkModels(root) {
         音色库: await isValid(t.kokoroVoices, KOKORO_VOICES),
         中英词表: (await isValid(t.kokoroLexiconUs, KOKORO_LEXICON_US)) && (await isValid(t.kokoroLexiconZh, KOKORO_LEXICON_ZH)),
       }
-      : {
-        合成声学: await isValid(t.ttsModel, TTS_ACOUSTIC),
-        声码器: await isValid(t.vocoder, TTS_VOCODER),
-      }),
+      : engine === 'melo'
+        ? {
+          合成模型: await isValid(t.meloModel, MELO_MODEL),
+          中文词表: await isValid(t.meloLexicon, MELO_LEXICON),
+          分词词典: await isValid(path.join(t.meloDir, 'dict', 'jieba.dict.utf8'), {}),
+        }
+        : {
+          合成声学: await isValid(t.ttsModel, TTS_ACOUSTIC),
+          声码器: await isValid(t.vocoder, TTS_VOCODER),
+        }),
   };
   return { ready: Object.values(items).every(Boolean), items, engine };
 }

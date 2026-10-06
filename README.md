@@ -3,7 +3,7 @@
 在对话界面里点一个按钮，就能**像打电话一样和 agent 说话**：本地语音识别听懂你，本地语音合成把回答念出来，而 agent 会立刻组队、把你的需求分派给队友，自己只负责跟你对话。
 
 - **听得见**：SenseVoiceSmall（INT8）本地识别，16kHz
-- **说得出**：MatchaTTS（中文/英文，16kHz）+ Vocos 声码器，首块延迟几十毫秒；可选 Kokoro 多语言 v1.1（103 个音色、24kHz、音色更自然，`DSH_TTS_ENGINE=kokoro`）
+- **说得出**：MatchaTTS（中文/英文，16kHz）+ Vocos 声码器，首块延迟几十毫秒；可选 Kokoro 多语言 v1.1（103 个音色、24kHz，`DSH_TTS_ENGINE=kokoro`）或 **MeloTTS zh-en（44.1kHz 原生输出，`DSH_TTS_ENGINE=melo` + `DSH_TTS_NATIVE_RATE=1`）**
 - **不联网也能用**：模型下好之后，识别与合成都在这台机器上完成
 - **模型自动准备**：首次点通话时自检，缺哪个下哪个（约 298 MB；DSH 已缓存识别模型时约 135 MB），下完自动接通
 - **换引擎不用重启**：语音子进程每次通话重新拉起，改默认引擎后**下一通电话就生效**
@@ -42,7 +42,7 @@
 | 语音合成（MatchaTTS 声学模型 + espeak 数据） | 79 MB | GitHub release |
 | 声码器（Vocos 16kHz） | 54 MB | GitHub release |
 
-选装 Kokoro（`DSH_TTS_ENGINE=kokoro`，音色更自然、首块延迟约 1 秒）时，另下载 365 MB 的 Kokoro 多语言 v1.1 包（声学模型 + 音色库 + 中英词表 + 词典）。**没选它就不会下载，也不会被判定为「模型缺失」**——两个引擎的清单互不影响。
+选装 Kokoro（`DSH_TTS_ENGINE=kokoro`，24kHz、103 个音色、首块约 1 秒）时，另下载 365 MB 的 Kokoro 多语言 v1.1 包；选装 MeloTTS（`DSH_TTS_ENGINE=melo`，**44.1kHz 原生输出**、首块约 0.9 秒）时另下载 159 MB（解压后约 182 MB）。**没选中的引擎就不会下载，也不会被判定为「模型缺失」**——三个引擎的清单互不影响。
 
 如果 DSH 自带语音插件已经下过 SenseVoice，插件会**直接复用那份缓存**，不重复占用磁盘。
 
@@ -102,12 +102,15 @@
 | `DSH_CALL_MODELS` | `~/.dsh/call-mode/models` | 模型目录 |
 | `DSH_CALL_THREADS` | `4` | 推理线程数 |
 | `DSH_STT_MODEL` / `DSH_STT_TOKENS` / `DSH_STT_VAD` | 自动解析 | 指定已有模型文件 |
-| `DSH_TTS_ENGINE` | `matcha` | 合成引擎：`matcha`（默认，首块几十毫秒）/ `kokoro`（音色更自然，首块约 1 秒） |
+| `DSH_TTS_ENGINE` | `matcha` | 合成引擎：`matcha`（默认，16kHz，首块几十毫秒）/ `kokoro`（24kHz，103 音色）/ `melo`（**44.1kHz**，单女声） |
+| `DSH_TTS_NATIVE_RATE` | 未设置 | 设为 `1` 时**按模型原生采样率输出**（Melo 44.1kHz / Kokoro 24kHz），客户端按上报采样率建播放缓冲；不设则统一压回 16kHz。**两侧必须成对**，见「已知限制」 |
 | `DSH_TTS_DIR` / `DSH_TTS_VOCODER` | 自动解析 | Matcha 的合成模型目录与声码器 |
 | `DSH_TTS_KOKORO_DIR` | 自动解析 | Kokoro 模型目录（只在选用 Kokoro 时用到） |
-| `DSH_TTS_SID` | `4` | Kokoro 音色编号（0–102）。实测 4 / 46 / 53 / 57 / 74 中英混读最清楚 |
+| `DSH_TTS_MELO_DIR` | 自动解析 | MeloTTS 模型目录（只在选用 Melo 时用到） |
+| `DSH_TTS_SID` | `4` | Kokoro 音色编号（0–102）。实测 4 / 46 / 53 / 57 / 74 中英混读最清楚（Melo/Matcha 单说话人，自动用 0） |
 | `DSH_TTS_ALLOW_FAST` | 未设置 | 设为 `1` 时不钳制 Kokoro 语速（默认钳到 1.0，见「已知限制」） |
-| `DSH_TTS_MODEL` | 自动解析 | 直接指定声学模型文件（两个引擎通用） |
+| `DSH_TTS_PRONOUNCE` | 未设置 | 设为 `0` 关闭「合成前读音白名单」（目前只有 `重载→虫在`） |
+| `DSH_TTS_MODEL` | 自动解析 | 直接指定声学模型文件（三个引擎通用） |
 | `DSH_SHERPA_PATH` | 自动解析 | `sherpa-onnx-node` 的绝对路径 |
 
 合成语速、等待上限、问候语等可通过插件配置传（`threads` / `modelsDir` / `greeting` / `stillWorkingText` / `rulesOrder`）。
@@ -134,11 +137,15 @@ Get-Content "$env:USERPROFILE\.dsh\call-mode\worker.log" -Tail 30   # 子进程�
 
 - 只支持 Windows x64（依赖 DSH 自带的 `sherpa-onnx-win-x64`）
 - 语音在**运行 DSH 的机器**上识别与合成，不是浏览器所在机器
-- 默认 Matcha 是单说话人、音色偏「念稿」，且**中英混读会把 `API` 念成 `baca`**（本机实测）；想要更自然的音色请设 `DSH_TTS_ENGINE=kokoro`
+- 默认 Matcha 是单说话人、音色偏「念稿」，且**中英混读会把 `API` 念成 `baca`**（本机实测）；想要更自然的音色请设 `DSH_TTS_ENGINE=kokoro`，想要高采样率请设 `DSH_TTS_ENGINE=melo` + `DSH_TTS_NATIVE_RATE=1`
 - **Kokoro 是可选引擎，首块延迟明显更高**：同一台机器实测约 0.6–1.5 s（Matcha 0.04–0.12 s），换来的是音色自然度与中英混读正确率（`这个 API 的 response 有点慢。` 能被 STT 逐字还原）
 - **Kokoro 语速被钳到 1.0**：它的 `speed` 是长度缩放，实测 1.10 起开始吞字、1.25 三句全部识别失败（1.0 三句全对）。需要更快请设 `DSH_TTS_ALLOW_FAST=1`（后果自负）。Matcha 不受影响，语速按宿主设置走
-- 链路对外仍是 16kHz：Kokoro 的 24kHz 输出会在子进程内抗混叠重采样到 16kHz（Matcha 本来就是 16kHz，直通；客户端、STT 的采样率假设不变）
-- 连续模式的阈值（VAD 门限、静音 0.7 秒、最长 30 秒）在 `client.js` / `server/worker.mjs` 中可调
+- **采样率是模型自带的，不是设置项**：Matcha 16k / Kokoro 24k / Melo **44.1k**。要更高就得换模型，**升采样不产生信息**。**48k 没有意义**：44.1k 的奈奎斯特已经 22.05kHz，盖过人耳可听范围，再高只是更大的文件。
+- **`DSH_TTS_NATIVE_RATE=1` 必须两侧配对**：worker 按模型采样率输出、客户端按 `/health.ttsSampleRate` 建播放缓冲（拿不到就回退 16k）。若一边开一边不开，44.1k 会被当 16k 播成 **2.75 倍速**。默认关闭，两侧都支持才建议打开。
+- **Melo 44.1k 的如实说明**：单女声；中文与数字（配合 `ruleFsts`）实测良好；**英文缩写（API/HTTP/SQL）不在它的词表里，会读成字母或读歪**，中英混读不如 Kokoro。它**不能传 `espeak-ng-data`**（传了会绕开自带中文词表、中文变乱码，已写进 `worker.mjs` 注释）。
+- **「糊」的改善有限，别期待翻倍**：实测同句能量分布——Matcha 16k 的 4–8kHz 占 0.16%、Kokoro 24k 占 0.21%、Melo 44.1k 占 **0.41%**（约 2.6 倍，主要改善齿音/咬字）；而 **8kHz 以上**：Matcha 结构上为 0、Kokoro 0.052%、Melo 0.097%。也就是说换 44.1k 拿回的是"空气感"，不是"变清晰一个档次"。
+- 试听对照：`C:\AI\work\quality-lab\rate\{16k-matcha,24k-kokoro,44k1-melo}.wav`（同句、同响度归一化）
+- 连续模式的阈值（VAD 门限、静音 3 秒、最长 120 秒）在 `client.js` / `server/worker.mjs` 中可调
 
 ## 九、卸载
 
@@ -150,4 +157,4 @@ Get-Content "$env:USERPROFILE\.dsh\call-mode\worker.log" -Tail 30   # 子进程�
 
 ## 许可证
 
-MIT（见 `LICENSE`）。使用的第三方组件：`sherpa-onnx`（Apache-2.0）、SenseVoiceSmall、Kokoro 多语言 v1.1（Apache-2.0，随包自带 `LICENSE`）、MatchaTTS 与 Vocos 权重（各自模型卡许可）。
+MIT（见 `LICENSE`）。使用的第三方组件：`sherpa-onnx`（Apache-2.0）、SenseVoiceSmall、Kokoro 多语言 v1.1（Apache-2.0，随包自带 `LICENSE`）、**MeloTTS zh-en（上游 MyShell MeloTTS 为 MIT，随包自带 `LICENSE`）**、MatchaTTS 与 Vocos 权重（各自模型卡许可）。

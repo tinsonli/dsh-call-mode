@@ -70,6 +70,8 @@ window.__ModuleLoader__.load({
       provision: () => callApi('/provision', {}),
       // 音色：列出 / 试听 / 设为当前（三条都不重启 worker、不断通话）
       voices: () => callApi('/voices', {}),
+      // 采样率配对：/health 里带着 worker 实际上报的 ttsSampleRate（宿主原样转发）
+      health: () => callApi('/health', {}),
       // 通话状态区（看得见、不念出来）
       status: () => callApi('/status', {}),
       preview: (args) => callApi('/preview', args),
@@ -177,6 +179,46 @@ window.__ModuleLoader__.load({
         this.captureRequested = false;
         this.volume = 1;              // 播放音量（0..1），open() 时建 master GainNode
         this.master = undefined;
+        // 播放采样率：由 worker 通过 /health 上报（原生档可能是 44.1k）。
+        // 录音与上传**始终**是 TARGET_RATE(16k)，只有播放这一段跟着模型走。
+        this.playRate = TARGET_RATE;
+        this.outCtx = undefined;      // 原生档专用的高采样率输出上下文
+        this.outMaster = undefined;
+      }
+
+      /**
+       * 设置播放采样率。非法/缺失一律回退 16k：宁可回到旧行为，
+       * 也绝不把 44.1k 当 16k 播成 2.75 倍速（配对是硬要求）。
+       */
+      setPlaybackRate(rate) {
+        const n = Number(rate);
+        const r = Number.isFinite(n) && n >= 8000 && n <= 192000 ? Math.round(n) : TARGET_RATE;
+        if (r === this.playRate) return this.playRate;
+        this.stopPlayback();
+        this.playRate = r;
+        this.nextPlayTime = 0;        // 换了输出上下文，播放时间轴要重置
+        try { this.outCtx?.close?.(); } catch { /* 忽略 */ }
+        this.outCtx = undefined;
+        this.outMaster = undefined;
+        return this.playRate;
+      }
+
+      /**
+       * 播放用上下文：16k 时沿用录音上下文（与旧行为完全一致）；
+       * 更高采样率时另开一个输出上下文——录音上下文是 16k 的，用它播 44.1k
+       * 会被浏览器再降回 16k，等于白换模型。
+       */
+      #playbackCtx() {
+        if (this.playRate === TARGET_RATE) {
+          return this.ctx ? { ctx: this.ctx, dest: this.master ?? this.ctx.destination } : null;
+        }
+        if (!this.outCtx) {
+          this.outCtx = new AudioContext({ sampleRate: this.playRate });
+          this.outMaster = this.outCtx.createGain();
+          this.outMaster.gain.value = this.volume;
+          this.outMaster.connect(this.outCtx.destination);
+        }
+        return { ctx: this.outCtx, dest: this.outMaster };
       }
 
       async open() {
@@ -205,6 +247,7 @@ window.__ModuleLoader__.load({
         const n = Number(value);
         this.volume = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1;
         if (this.master !== undefined) this.master.gain.value = this.volume;
+        if (this.outMaster !== undefined) this.outMaster.gain.value = this.volume;
         return this.volume;
       }
 
@@ -212,8 +255,11 @@ window.__ModuleLoader__.load({
         try { this.node?.disconnect(); this.source?.disconnect(); } catch { /* 忽略 */ }
         this.stream?.getTracks().forEach((t) => t.stop());
         this.ctx?.close?.();
+        try { this.outCtx?.close?.(); } catch { /* 忽略 */ }
         this.node = this.source = this.ctx = this.stream = null;
         this.master = undefined;
+        this.outCtx = undefined;
+        this.outMaster = undefined;
         this.frames = [];
         this.onEvent({ type: 'idle' });
       }
@@ -310,26 +356,28 @@ window.__ModuleLoader__.load({
         return out;
       }
 
-      /** 播放一段 PCM（int16） */
+      /** 播放一段 PCM（int16）。按 playRate 建缓冲，采样率必须与 worker 输出配对。 */
       play(pcm) {
-        if (!this.ctx || pcm.length === 0) return;
+        const out = this.#playbackCtx();
+        if (!out || pcm.length === 0) return;
+        const { ctx, dest } = out;
         // 长时间空闲/休眠后浏览器会把 AudioContext 挂起：不 resume 就是「有音频但听不到」。
         // 每次播放都补一次 resume，并把上下文状态上报一次（下一次听不到时能在 call.log 里看到）。
-        if (this.ctx.state !== 'running') {
-          this.onEvent({ type: 'audio', state: this.ctx.state, sampleRate: this.ctx.sampleRate });
-          try { void this.ctx.resume(); } catch { /* 忽略 */ }
+        if (ctx.state !== 'running') {
+          this.onEvent({ type: 'audio', state: ctx.state, sampleRate: ctx.sampleRate, playRate: this.playRate });
+          try { void ctx.resume(); } catch { /* 忽略 */ }
         } else if (this.audioReported !== true) {
           this.audioReported = true;
-          this.onEvent({ type: 'audio', state: this.ctx.state, sampleRate: this.ctx.sampleRate });
+          this.onEvent({ type: 'audio', state: ctx.state, sampleRate: ctx.sampleRate, playRate: this.playRate });
         }
         const f32 = new Float32Array(pcm.length);
         for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
-        const buffer = this.ctx.createBuffer(1, f32.length, TARGET_RATE);
+        const buffer = ctx.createBuffer(1, f32.length, this.playRate);
         buffer.copyToChannel(f32, 0);
-        const src = this.ctx.createBufferSource();
+        const src = ctx.createBufferSource();
         src.buffer = buffer;
-        src.connect(this.master ?? this.ctx.destination);   // 走 master 总音量
-        const now = this.ctx.currentTime;
+        src.connect(dest);                                  // 走 master 总音量
+        const now = ctx.currentTime;
         const startAt = Math.max(now, this.nextPlayTime);
         src.start(startAt);
         this.nextPlayTime = startAt + buffer.duration;
@@ -377,6 +425,8 @@ window.__ModuleLoader__.load({
       let playSrcs = [];
       let master = null;
       let userVolume = 1;               // 音量滑块（0..1），铃声/接通音/拨号前试听共用
+      // 试听播放采样率：与通话播放同源（worker 上报），缺省 16k
+      let playRate = TARGET_RATE;
       const ensure = () => {
         if (ctx === null) ctx = new AudioContext();
         if (ctx.state === 'suspended') void ctx.resume?.();
@@ -437,6 +487,13 @@ window.__ModuleLoader__.load({
           try { burst([[880, 0, 0.15, 0.75]]); } catch { /* 忽略 */ }
         },
         setVolume,
+        /** 试听也要按上报采样率建缓冲；非法值回退 16k。 */
+        setPlaybackRate(rate) {
+          const n = Number(rate);
+          playRate = Number.isFinite(n) && n >= 8000 && n <= 192000 ? Math.round(n) : TARGET_RATE;
+          return playRate;
+        },
+        get playRate() { return playRate; },
         get volume() { return userVolume; },
         /**
          * 播放一段外部 PCM（int16）：拨号前**还没有麦克风/引擎**时也能试听音色。
@@ -448,7 +505,7 @@ window.__ModuleLoader__.load({
             const audio = ensure();
             const f32 = new Float32Array(int16.length);
             for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
-            const buffer = audio.createBuffer(1, f32.length, TARGET_RATE);
+            const buffer = audio.createBuffer(1, f32.length, playRate);
             buffer.copyToChannel(f32, 0);
             const src = audio.createBufferSource();
             src.buffer = buffer;
@@ -653,6 +710,9 @@ window.__ModuleLoader__.load({
           }
           await this.engine.open();
           if (this.disposed) { try { this.engine.close(); } catch { /* 忽略 */ } return; }
+          // 采样率配对必须在放第一段音频（问候语）之前完成：worker 原生档可能是 44.1k，
+          // 若播放侧还按 16k 建缓冲就会放成快 2.75 倍。拿不到就回退 16k。
+          await this.#syncPlaybackRate();
           // 接通顺序固定：停铃 → 一声「嘟」→ 问候语
           this.#stopRinging();
           this.connectedAt = Date.now();
@@ -667,6 +727,25 @@ window.__ModuleLoader__.load({
           this.#stopRinging();
           if (!this.disposed) this.#patch({ phase: 'error', status: `${this.t('error')}: ${e.message}` });
         }
+      }
+
+      /**
+       * 采样率配对：从宿主 /health 读 worker **实际**上报的输出采样率
+       * （worker 原生档 = 模型采样率，如 Melo 44.1k），同步给通话播放与试听播放。
+       * 拿不到 / 非法一律回退 16k —— 宁可回到旧行为，也绝不放成变速。
+       * @returns {Promise<number>} 实际采用的播放采样率
+       */
+      async #syncPlaybackRate() {
+        let rate = TARGET_RATE;
+        try {
+          const info = unwrap(await this.call.health());
+          const n = Number(info?.worker?.ttsSampleRate);
+          if (Number.isFinite(n) && n >= 8000 && n <= 192000) rate = Math.round(n);
+        } catch { /* 忽略：保持 16k */ }
+        try { this.engine.setPlaybackRate(rate); } catch { /* 忽略 */ }
+        try { this.sounds.setPlaybackRate(rate); } catch { /* 忽略 */ }
+        this.playRate = rate;
+        return rate;
       }
 
       #startPolling() {
