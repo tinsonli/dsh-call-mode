@@ -969,15 +969,16 @@ window.__ModuleLoader__.load({
       #applyRingtone(res) {
         try {
           if (typeof res?.ringtone === 'string' && res.ringtone !== '') {
-            const id = this.sounds.setPreset?.(res.ringtone);
-            if (id !== null && id !== undefined) this.#patch({ notice: `${this.t('ringtoneChanged')} ${id}` });
+            // 成功**不弹提示**：语音里已经念过「好，换成 XX。」，界面再弹一条是重复信息
+            // （用户要求界面零痕迹）。失败仍然要提示，见下面的 ringtoneFailed。
+            this.sounds.setPreset?.(res.ringtone);
             return;
           }
           if (typeof res?.ringtoneFile === 'string' && res.ringtoneFile !== '') {
             const url = this.call.ringtoneUrl?.(res.ringtoneFile);
             if (typeof url !== 'string') return;
-            Promise.resolve(this.sounds.loadCustom?.(url, res.ringtoneFile)).then(
-              () => { if (!this.disposed) this.#patch({ notice: `${this.t('ringtoneChanged')} ${res.ringtoneFile}` }); },
+            // 成功不弹提示（同上）；失败必须提示——不出声又不给提示，用户会以为彩蛋坏了
+            Promise.resolve(this.sounds.loadCustom?.(url, res.ringtoneFile)).catch(
               () => { if (!this.disposed) this.#patch({ notice: this.t('ringtoneFailed') }); },
             );
           }
@@ -1633,7 +1634,7 @@ window.__ModuleLoader__.load({
             statusLoading: '读取状态…', statusIdle: '空闲', statusBusy: '进行中',
             statusTeammates: '已派队友', statusTasks: '建了任务', statusMessages: '发了消息', statusLast: '最近',
             dialTitle: '拨号', dialWith: '拨给', dialNow: '拨号', volume: '音量',
-            ringtoneChanged: '铃声已换为', ringtoneFailed: '铃声文件读取失败',
+            ringtoneFailed: '铃声文件读取失败',
           },
           en: {
             button: 'Call', title: 'Call mode', close: 'Collapse', hangUp: 'Hang up',
@@ -1657,7 +1658,7 @@ window.__ModuleLoader__.load({
             statusLoading: 'Loading status…', statusIdle: 'Idle', statusBusy: 'Working',
             statusTeammates: 'teammates', statusTasks: 'tasks', statusMessages: 'messages', statusLast: 'Latest',
             dialTitle: 'New call', dialWith: 'Calling', dialNow: 'Call', volume: 'Volume',
-            ringtoneChanged: 'Ringtone set to', ringtoneFailed: 'Could not read the ringtone file',
+            ringtoneFailed: 'Could not read the ringtone file',
           },
         }), 'dsh-call-mode: dictionaries');
 
